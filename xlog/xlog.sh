@@ -86,7 +86,7 @@ log_event() {
     local level="$1" message="$2"
     [[ ${LOG_LEVELS[${level^^}]:-1} -lt ${LOG_LEVELS[${LOG_LEVEL^^}]:-1} ]] && return
 
-    local timestamp=$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S')
+    local timestamp=$(date '+%Y-%m-%dT%H:%M:%S.%3N%z' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S')
     local hostname=${HOSTNAME:-$(hostname -s 2>/dev/null || echo "unknown")}
     local pid=$$ user="${USER:-$(whoami 2>/dev/null || echo 'unknown')}"
 
