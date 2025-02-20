@@ -1,3 +1,9 @@
+## [4.0.4] - 2025-02-20
+- **Security**: Added millisecond precision to ISO 8601 timestamps for enhanced forensic capabilities.
+- **Enhancements**: Prioritized XID:PID identifiers in log format for improved traceability.
+- **Standardization**: Unified log format across plain text and JSON outputs.
+- **UI**: Fixed log level alignment for consistent display.
+
 ## [4.0.3] - 2025-02-19
 - **Enhancements**: Updated to production-ready version; improved error handling
   with `exit_with_error`; tightened security (log permissions to 600, expanded
