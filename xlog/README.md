@@ -77,7 +77,7 @@ XID                  Universal session ID
 
 - Plain text (default):
   ```
-  2025-02-19T12:34:56+0000 [INFO ] [hostname] [XID:abcdef12 PID:1234] [user] -
+  [XID:abcdef12 PID:1234] 2025-02-20T15:36:20.443+0000 [INFO ] [hostname] [user] -
   Starting command: ls -la
   ```
 - JSON:
