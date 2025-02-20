@@ -66,19 +66,19 @@ rotate_logs() {
     fi
 }
 
-# Log event in JSON format
+# Log event in JSON format - MODIFIED to put xid:pid first, then timestamp
 _log_json() {
     local timestamp="$1" level="$2" hostname="$3" pid="$4" user="$5" message="$6"
     local escaped_message=$(echo "$message" | tr '\n' ' ' | sed 's/"/\\"/g; s/\\/\\\\/g')
-    printf '{"timestamp":"%s","level":"%s","hostname":"%s","xid":"%s","pid":%d,"user":"%s","message":"%s"}\n' \
-        "$timestamp" "$level" "$hostname" "$SESSION_ID" "$pid" "$user" "$escaped_message" >> "$LOG_FILE"
+    printf '{"xid":"%s","pid":%d,"timestamp":"%s","level":"%s","hostname":"%s","user":"%s","message":"%s"}\n' \
+        "$SESSION_ID" "$pid" "$timestamp" "$level" "$hostname" "$user" "$escaped_message" >> "$LOG_FILE"
 }
 
-# Log event in plain format
+# Log event in plain format - MODIFIED to put XID:PID first, then timestamp
 _log_plain() {
     local timestamp="$1" level="$2" hostname="$3" pid="$4" user="$5" message="$6"
-    printf '%s [%5s] [%s] [XID:%s PID:%d] [%s] - %s\n' \
-        "$timestamp" "$level" "$hostname" "$SESSION_ID" "$pid" "$user" "$message" >> "$LOG_FILE"
+    printf '[XID:%s PID:%d] %s [%-5s] [%s] [%s] - %s\n' \
+        "$SESSION_ID" "$pid" "$timestamp" "$level" "$hostname" "$user" "$message" >> "$LOG_FILE"
 }
 
 # Main logging function
