@@ -1,0 +1,4 @@
+#!/bin/bash
+# HELP: list r03 clients (via xssh+sudo)
+
+xssh r03 'sudo su - -c /root/show-clients'

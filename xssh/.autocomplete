@@ -1,0 +1,23 @@
+ac_()
+{
+    local cur prev opts
+    COMPREPLY=()
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+    if [[ -f "$HH/.config-${LC_XSILO}.tpl" ]]; then
+        opts=$(grep -E '^Host ' $HH/.config-${LC_XSILO}.tpl 2>/dev/null \
+        | grep -v 'Host \*' \
+        | awk '{$1=""; print}' \
+        | awk '{for(i=1;i<=NF;i++) if($i !~ /[\*\?]/) printf "%s ", $i; print ""}' \
+        | sed -E 's/\[([0-9.]+)\]/{\1}/g' \
+        | xargs -n1 \
+        | sort -u)
+    else
+        opts=""
+    fi
+    COMPREPLY=( $(compgen -W "${opts}" -- ${cur}) )
+    return 0
+}
+
+complete -F ac_ xssh
+

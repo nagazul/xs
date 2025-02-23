@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+XT=$(eval echo "${XH:-$LU/.xssh*}")
+#echo "XT:$XT"
+XW=$(eval echo "${XH:=$LU/.xssh.d}")
+a="" am=" -o ControlMaster=auto -o ControlPath=~/.ssh/.xssh-%r@%h:%p -o ControlPersist=yes"
+h="" r="" sp="" rc=""
+shc () {
+[[ "$sf" == /tmp/* ]] && rm "$sf"
+[[ "$sd" == /tmp/* ]] && { rmdir "$sd" 2>/dev/null || echo "[xssh] $sd contains data"; } || :
+ec=$(find /tmp -type d -name 'xssh-*' -empty 2>/dev/null | wc -l)
+nc=$(find /tmp -type d -name 'xssh-*' ! -empty 2>/dev/null | wc -l)
+[[ -n "$sp" ]] && { kill "$sp" 2>/dev/null && echo "[xssh] rsync PID $sp killed" && sp="" || echo "[xssh] failed to kill rsync or already terminated"; }
+(( nc > 0 || ec > 20 )) && echo "[xssh] /tmp/xssh-* dirs: $nc with data, $ec empty";}
+shd () {
+sf=$(mktemp /tmp/xssh-XXXXXXXXXX);sd=$(mktemp -d /tmp/xssh-XXXXXXXXXX)
+printf "port=%s\n[xssh]\npath=%s\nread only=false\nlist=yes\nuse chroot=false\n" "$XP" "$sd" > "$sf"
+rsync --daemon --no-detach --config="$sf" & sp=$!;}
+xssh() {
+	[[ $XP =~ ^[0-9]+$ ]] && ap=" -R $XP:localhost:$XP"
+	#echo "h:$h";echo "a-am:$a$am$ap";echo "r:$r"
+o="openssl base64"; od="openssl base64 -d"
+command -v openssl >/dev/null 2>&1 || { echo >&2 "[xssh] missing openssl. aborting.";return 1;}
+[ ! -f "$XW/.xsshrc" ] && echo "[xssh] missing file: $XW/.xsshrc" >&2 && exit 1
+	if [[ -f "$HH/.config-${LC_XSILO}.tpl" && -n "$XUSER" ]]; then
+envsubst < "$HH/.config-${LC_XSILO}.tpl" > "$HH/.config"
+[[ -f "$HH/.config" ]] && am+=" -F $HH/.config"
+xw=$(ssh "$h" $a$am "echo \$LC_XSILO"|tr -d '\0')
+#xw=$(ssh "$h" $a$am|tr -d '\0')
+xwf=".config-${xw}.tpl"
+#echo "xwf:$xwf"
+[[ -f "$HH/${xwf}" ]] && xwt=$(cat << EOF
+echo $'$(cat $HH/${xwf} | $o)' | $od > \$XH/${xwf}
+EOF
+)
+	fi
+te="--exclude={.git,LICENSE,README*,.config*}";
+tx=$(eval echo $te)
+tp="$tx -czhf - $(for dir in $XT; do printf '%s ' '-C' "$dir" '.'; done)"
+	#echo "te: $te";echo "tp: $tp"
+	#echo $(tar $tp|tar -tzf -)
+z=$(tar $tp|wc -c) && [ $z -gt 65536 ] && echo $'[xssh] size ('$z') > 64kb' >&2 && exit 1
+trap shc 0
+[[ "$motd" != "-" ]] && motd=$(cat << EOF
+[ -z "$r" ] && [ ! -e \$XH/.hushlogin ] && \$XH/bin/,motd.orig
+[ -z "$r" ] && [ ! -e \$XH/.hushxssh ] && \$XH/bin/,motd
+echo "$r" >> \$XH/.xsshrc
+EOF
+) || motd=""
+	read -r -d '' s <<EOB
+export XORIGIN=$(echo "$h" | awk -F@ '{print (NF>1 ? $NF : $0)}')
+export XUSER="$XUSER";export XDEBUG="$XDEBUG"
+export RC="$rc";export XV="$XV";export XZ=$z
+export XH=\$(mktemp -d /tmp/ssh+XXXXXXXXXX)
+${XP:+export XP=$XP}
+echo $'$(tar $tp | $o)' | $od | tar -mxzf - -C \$XH
+${xwt}
+${motd}
+unset XK XI
+bash -c $'trap "[[ \$XH == /tmp/ssh+* ]] && rm -rf \$XH;" EXIT; bash --rcfile \$XH/.xsshrc'
+EOB
+	#echo "s:$s"
+	ssh -t "$h" $a$am$ap "$s";}
+hR() {
+if [[ -z $1 || $1 == -* || ! $1 =~ ^[0-9]+:[^:]+:[0-9]+$ ]]; then
+XP=${XP:-$(shuf -i 50000-65000 -n 1)}
+#a+=" -R $XP:localhost:$XP"
+shd
+else a+=" -R $1";return 1;fi;}
+hH() {
+local f="${XH:-$LH}/.hosts" h="${1%%[/:]*}" r
+r=$(awk -v h="$h" '$0 ~ "(^|[[:space:]])"h"($|[[:space:]])" {print $1; exit}' "$f" 2>/dev/null)
+echo "${r:-$h}";}
+arg() {
+while [[ $# -gt 0 ]]; do
+case $1 in
+-V) echo -e "$XV\n$(ssh -V 2>&1)"; exit 0;;
+-DEBUG) echo "HH: $HH";exit 0;;
+-R) hR "$2";shift $?;;
+-NORC) rc="-";;
+-NOMOTD) motd="-";;
+-M0) am="";;
+-MX) am+=" -O exit";;
+-[BbcDEeFIiJLlmOopQRSWw]) a+=" $1 $2";shift;;
+-*) a+=" $1";;
+ *) [[ -z $h ]]&&h=${1%%[/:]}||{ r="${*};exit"; break;};;
+esac;shift;done
+[[ $h ]]&&h=$(hH $h)||{ ssh $a$am;exit $?;}
+return 0;}
+arg "$@" && xssh

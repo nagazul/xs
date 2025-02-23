@@ -1,0 +1,18 @@
+# pick between LH:LocalHome and XH:TransferedHome
+# if XH is present it takes precedence
+H_=${XH:-$LH}
+
+# clean env to allow the new user to rebuild it from scratch
+LU=""
+LPATH=""
+
+if [[ -n "$XH" ]]; then
+    opt="XH=${H_}"
+elif [[ -n "$LH" ]]; then
+    opt="LH=${H_}"
+fi
+
+sudo -E su - "${1:-root}" -c "XSSHRC='' $opt LCHAIN=${LCHAIN} XORIGIN=${XORIGIN} XP=${XP} LC_XSILO=${LC_XSILO} bash --rcfile \"${H_}/.bashrc\""
+
+#sudo -E su - ${1:-root} -c "XSSHRC='' LH=${LH} LCHAIN=${LCHAIN} bash --rcfile \"${H_}/.bashrc\""
+#sudo -E -u "${1:-root}" bash -c "XSSHRC='' LH='$LH' bash --rcfile \"${H_}/.bashrc\""

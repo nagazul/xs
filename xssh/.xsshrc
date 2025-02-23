@@ -1,0 +1,88 @@
+#!/bin/bash
+
+# prevent loops
+[ "$XSSHRC" ] && return || export XSSHRC=true
+export HH=${XH:-$LH}
+
+. $HH/.autocomplete
+
+xv_() {
+  sd="$(dirname "${BASH_SOURCE[0]}")"
+  xv=$(cat "${sd}/VERSION")
+  
+  if command -v git >/dev/null 2>&1; then
+    xd=$(git -C "$sd" log -1 --format="%cd" --remotes=origin --date=iso-strict 2>/dev/null | xargs -I{} date -u -d "{}" +"%Y-%m-%dT%H:%M:%SZ" || echo "")
+    [ -n "$xd" ] && xv="${xv%% *}"
+    xs=$(git -C "$sd" rev-parse --short HEAD 2>/dev/null || echo "")
+    [ -n "$(git -C "$sd" status --porcelain 2>/dev/null)" ] && xs="$xs-dirty"
+  fi
+  XV="h2.io/XSSH $xv${xd:+ $xd}${xs:+ $xs}"
+}
+p+ () {
+    local r=""
+    IFS=':' read -r -a ps <<< "$1:$2"
+    for p in "${ps[@]}"; do
+        [[ ":$r:" != *":$p:"* ]] && r="$r:$p"
+    done
+    echo "${r#:}"
+}
+
+# HELP: uses xssh by default instead of ssh (use \ssh if you want the plain ssh)
+#alias ssh='xssh'
+#alias xssh='xssh -NOMOTD'
+
+# HELP: history | grep 
+alias ,hg='history|grep'
+
+# HELP: ls ordered by size, expanded time style (-h for human readable)
+alias ,ls='ls -a -l --human-readable --size --block-size=1 -S -F --time-style=+"%Y-%m-%d %H:%M:%S" -r'
+
+# HELP: du ordered, human readable
+alias ,du='function _du() { du --max-depth=1 -h "${1:-./}" 2>/dev/null | sort -h; }; _du'
+
+# HELP: clean current history
+alias ,h0='unset HISTFILE && history -c && history -r ~/.bash_history'
+
+if [ "$XH" ]; then
+	# executed via xssh login
+	if [ "$RC" != "-" ]; then
+	[ -r /etc/profile ] && . /etc/profile
+	[ -r ~/.bash_profile ] && . ~/.bash_profile ||
+	[ -r ~/.bash_login ] && . ~/.bash_login ||
+	[ -r ~/.profile ] && . ~/.profile
+	fi
+
+	export XPATH=$XH:$XH/bin
+	XL=$XH/lib			# prepare XH libray path to load
+	PATH=$(p+ $XPATH $PATH)
+fi
+if [ "$LH" ]; then
+	export LCHAIN+="+${USER}"
+	export LU=${LH%/*}
+	export LD=$(ls -d ${LU}/.xssh*/bin 2>/dev/null| sort -u | tr '\n' ' ')
+
+	export XV && xv_
+	[ -n "$XD" ] && PROMPT_COMMAND=xv_
+
+	# P1: localy sourced from .bashrc (development)
+	export LPATH="${LPATH:+$LPATH:}$LH"
+	shopt -s nullglob
+	for dir in $LD; do
+		[[ -d "$dir" ]] || continue  # Skip if not a directory
+		LPATH="$LPATH:$dir"
+	done
+
+	: "${XL:=$LH/lib}"		# use LH library path if XH is not present
+	PATH=$(p+ $PATH $LPATH)
+fi
+
+# load libraries
+for file in $XL/*; do
+	[[ -r "$file" ]] && . "$file"
+done
+
+SUSER=$(echo $USER | awk -F. '{print (NF==2 ? substr($1,1,1)"."substr($2,1,1) : $0)}')
+PS1='${debian_chroot:+($debian_chroot)}'
+PS1+='\[\033[01;$(if [[ $EUID == 0 ]]; then echo "31"; elif [[ $USER == *-debug ]]; then echo "35"; else echo "32"; fi)m\]${SUSER}\[\033[00m\]'
+PS1+='\[\033[01;32m\]@${XORIGIN:-\h}'
+PS1+='\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ '
