@@ -1,0 +1,15 @@
+#!/bin/bash
+# HELP: ,get path (needs xssh -R on the machine you want to rsync the path)
+
+# Ensure the source directory argument is provided (required)
+if [[ -z $1 ]]; then
+    echo "Usage: $(basename $0) path"
+    exit 1
+fi
+
+sd=$1;dd=xssh
+port=${3:-$XP}
+
+command="rsync -a --port=$port $sd rsync://localhost/$dd"
+echo "[xssh] executed $command"
+eval $command

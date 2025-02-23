@@ -1,0 +1,11 @@
+#!/bin/bash
+# HELP: list processes for a specific user in tree format
+
+. ${XH:=$LH}/lib/colors
+
+sort_option="pid"
+ps -eo pid,ppid,user,etime,%cpu,cmd --forest --sort="$sort_option"
+
+# Show usage example as the last line:
+echo -e "${CY}Usage:${CN} ./,ps [%pid | %mem | pid | ppid | -etime]"
+
