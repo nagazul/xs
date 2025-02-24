@@ -880,8 +880,15 @@ load_all_keys() {
 
     for key_link in "$KEYS_DIR"/*; do
         [ -L "$key_link" ] || continue
-        total=$((total + 1))
-        key_path=$(readlink -f "$key_link")
+        ((total++))
+        local key_path=$(readlink -f "$key_link")
+
+        # Check if key is already loaded in agent
+        if ssh-add -l 2>/dev/null | grep -q "$(ssh-keygen -l -f "$key_path" 2>/dev/null | cut -d' ' -f2)"; then
+            ((success++))
+            printf "${GC}Key already loaded: %s${NC}\n" "$key_path"
+            continue
+        fi
 
         if ssh-keygen -y -f "$key_path" -P "" >/dev/null 2>&1; then
             # Non-encrypted key
