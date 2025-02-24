@@ -1,0 +1,1265 @@
+#!/bin/bash
+# Enhanced SSH Agent Management with Multi-Key Support
+# dependencies: ssh-agent, ssh-add, openssl, chmod, ps, grep, awk, kill, expect
+
+# Guard against multiple full loads
+if [ -n "${XKEYS_LOADED+x}" ]; then
+    return 0
+fi
+readonly XKEYS_LOADED=1
+
+#
+# Configuration Section
+#
+
+# Debug mode - set to 1 to enable debug logging
+DEBUG_MODE=${DEBUG_MODE:-0}
+
+# Define color codes (enable interpretation of backslash escapes)
+GC=$'\e[32m'    # Green Color
+RC=$'\e[31m'    # Red Color
+GY=$'\e[37m'    # Gray Color
+NC=$'\e[0m'     # No Color
+
+# Directory Setup - prefer /dev/shm for persistence until reboot
+if [ -w "/dev/shm" ]; then
+    TMP_BASE="/dev/shm"
+else
+    TMP_BASE="/tmp"  # Fallback if /dev/shm not available
+fi
+
+# Directory Constants - only set if not already defined
+[ -z "${TMP_DIR+x}" ] && readonly TMP_DIR="$TMP_BASE/xkeys-$UID"
+[ -z "${TMP_PATTERN+x}" ] && readonly TMP_PATTERN="^/(dev/shm|tmp)/xkeys-[0-9]+(/.*)?$"
+[ -z "${SSH_DIR+x}" ] && readonly SSH_DIR="$HOME/.ssh"
+[ -z "${KEYS_DIR+x}" ] && readonly KEYS_DIR="$SSH_DIR/.xssh.keys"
+[ -z "${KEYS_ENC+x}" ] && readonly KEYS_ENC="$SSH_DIR/.xssh.enc"
+[ -z "${AGENT_ENV+x}" ] && readonly AGENT_ENV="$TMP_DIR/.xssh.agent"
+
+# File patterns - only set if not already defined
+[ -z "${AGENT_PATTERN+x}" ] && readonly AGENT_PATTERN="\.xssh\.agent$"
+[ -z "${PASS_PATTERN+x}" ] && readonly PASS_PATTERN="\.enc$"
+[ -z "${ENC_PATTERN+x}" ] && readonly ENC_PATTERN="\.xssh\.enc$"
+[ -z "${KEYS_PATTERN+x}" ] && readonly KEYS_PATTERN="\.xssh\.keys$"
+[ -z "${LINK_PATTERN+x}" ] && readonly LINK_PATTERN="\.xssh\.keys/"
+
+# Cache for master password during operations
+MASTER_PASSWORD_CACHE=""
+
+#
+# Initialization
+#
+
+# Track temporary files for cleanup
+declare -a TEMP_FILES
+
+# Logging function
+log_debug() {
+    [ "$DEBUG_MODE" -eq 1 ] && printf "${GY}[DEBUG] $1${NC}\n"
+}
+
+# Cleanup functions
+cleanup_temp_files() {
+    for tmp_file in "${TEMP_FILES[@]}"; do
+        safe_delete_temp_file "$tmp_file"
+        log_debug "Deleted temporary file: $tmp_file"
+    done
+}
+
+cleanup_master_password() {
+    MASTER_PASSWORD_CACHE=""
+    log_debug "Master password cache cleared."
+}
+
+# Register cleanup handlers
+trap cleanup_temp_files EXIT
+trap cleanup_master_password EXIT
+
+# Create and secure directories
+mkdir -p "$TMP_DIR" "$KEYS_DIR" "$KEYS_ENC"
+chmod 700 "$TMP_DIR" "$KEYS_DIR" "$KEYS_ENC"
+
+#
+# Core Security Functions
+#
+
+# Core file safety function - handles files, symlinks, and sockets
+safe_delete() {
+   local file="$1"
+   local pattern="$2"    # Optional regex pattern to match
+   local perms="$3"      # Optional permissions to check
+
+   # Basic checks
+   [ -e "$file" -o -h "$file" ] || return 1      # Must exist or be symlink
+   [ -O "$file" ] || return 1                    # Must be owner
+   [ ! -d "$file" ] || return 1                  # Not a directory
+   [ -w "$(dirname "$file")" ] || return 1       # Parent dir writable
+
+   # Pattern and permissions checks
+   [ -n "$pattern" ] && [[ ! "$file" =~ $pattern ]] && return 1
+   [ -n "$perms" ] && [ ! -h "$file" ] && [[ ! "$(stat -L -c "%a" "$file")" =~ ^($perms)$ ]] && return 1
+
+   if [ -h "$file" ]; then                       # Handle symlinks
+       unlink "$file"
+       return $?
+   fi
+
+   if [ -S "$file" ]; then                       # Handle sockets
+       [ "$(stat -L -c "%a" "$file")" = "600" ] || return 1
+   fi
+
+   if [ -f "$file" ]; then                       # Handle regular files
+       dd if=/dev/zero of="$file" bs=4096 count=1 conv=notrunc >/dev/null 2>&1
+       sync "$file"
+   fi
+
+   rm -f "$file"
+}
+
+# Directory deletion with security checks
+safe_delete_dir() {
+   local dir="$1"
+   local pattern="$2"
+
+   [ -d "$dir" ] || return 1                     # Must be directory
+   [ -O "$dir" ] || return 1                     # Must be owner
+   [ ! -h "$dir" ] || return 1                   # Not a symlink
+   [ -w "$(dirname "$dir")" ] || return 1        # Parent dir writable
+   [[ "$dir" =~ $pattern ]] || return 1          # Must match pattern
+
+   # Find and securely delete all files first
+   find "$dir" -type f -exec sh -c '
+       for f; do
+           if [ -f "$f" ] && [ -O "$f" ] && [ ! -h "$f" ]; then
+               dd if=/dev/zero of="$f" bs=4096 count=1 conv=notrunc >/dev/null 2>&1
+               sync "$f"
+               log_debug "Safe delete file: $f"
+               rm -f "$f"
+           fi
+       done
+   ' sh {} +
+
+   log_debug "Remove empty dir: $dir"
+   rmdir "$dir" 2>/dev/null                      # Remove empty directory
+}
+
+# Specialized delete functions
+safe_delete_agent_file() {
+    safe_delete "$1" "$AGENT_PATTERN" "600"
+}
+
+safe_delete_passphrase() {
+    safe_delete "$1" "$PASS_PATTERN" "400"
+}
+
+safe_delete_temp_file() {
+    safe_delete "$1" "$TMP_PATTERN" "600"
+}
+
+safe_delete_link() {
+    safe_delete "$1" "$LINK_PATTERN"
+}
+
+# Derive a key encryption key (KEK) from the master password
+derive_kek() {
+    local master_password="$1"
+    echo -n "$master_password" | openssl dgst -sha256 | awk '{print $2}'
+}
+
+# Function to get checksum for a key's full path
+key_checksum() {
+    local key_path="$1"
+    echo -n "$key_path" | sha256sum | awk '{print $1}'
+}
+
+# Sanitize and validate file paths
+sanitize_path() {
+    local path="$1"
+    # Remove any null bytes
+    path="${path//$'\0'/}"
+    # Convert to absolute path and normalize
+    path=$(realpath -q "$path" 2>/dev/null) || return 1
+    echo "$path"
+}
+
+# Validate SSH key file
+validate_ssh_key() {
+    local key_path="$1"
+    local sanitized_path
+
+    # Sanitize path
+    sanitized_path=$(sanitize_path "$key_path") || return 1
+
+    # Check basic path requirements
+    [[ -f "$sanitized_path" ]] || return 1
+    [[ -r "$sanitized_path" ]] || return 1
+
+    # Verify it's actually an SSH key
+    grep -q "PRIVATE KEY" "$sanitized_path" 2>/dev/null || return 1
+
+    echo "$sanitized_path"
+}
+
+# Secure file operations
+secure_copy() {
+    local src="$1"
+    local dst="$2"
+    local temp_file
+
+    # Create temporary file with secure permissions
+    temp_file=$(mktemp)
+    chmod 600 "$temp_file"
+    TEMP_FILES+=("$temp_file")
+
+    # Copy with atomic operation
+    cp -p "$src" "$temp_file" &&
+    mv "$temp_file" "$dst"
+}
+
+#
+# SSH Agent Management Functions
+#
+
+# Check if an SSH agent is running and functional
+check_ssh_agent() {
+    if [ -f "$AGENT_ENV" ]; then
+        . "$AGENT_ENV" >/dev/null 2>&1
+
+        if [ -n "$SSH_AGENT_PID" ] && ps -p "$SSH_AGENT_PID" >/dev/null 2>&1; then
+            if [ -n "$SSH_AUTH_SOCK" ] && [ -S "$SSH_AUTH_SOCK" ]; then
+                if ssh-add -l >/dev/null 2>&1 || [ $? -eq 1 ]; then
+                    return 0
+                fi
+            fi
+        fi
+
+        safe_delete_agent_file "$AGENT_ENV"
+    fi
+    return 1
+}
+
+# Initialize a new SSH agent
+init_ssh_agent() {
+    if check_ssh_agent; then
+        printf "${GC}Reusing existing SSH agent (PID: $SSH_AGENT_PID)${NC}\n"
+        return 0
+    fi
+
+    mkdir -p "$TMP_DIR" || {
+        printf "${RC}Failed to create runtime directory${NC}\n"
+        return 1
+    }
+    chmod 700 "$TMP_DIR"
+
+    local agent_dir
+    agent_dir=$(mktemp -d "$TMP_DIR/agent.XXXXXX")
+    chmod 700 "$agent_dir"
+
+    SSH_AUTH_SOCK="$agent_dir/agent.sock"
+    local temp_env
+    temp_env=$(mktemp "$TMP_DIR/env.XXXXXX")
+    chmod 600 "$temp_env"
+
+    ssh-agent -a "$SSH_AUTH_SOCK" > "$temp_env" || {
+        safe_delete "$temp_env" "$TMP_PATTERN" "600"
+        safe_delete_dir "$agent_dir" "$TMP_PATTERN"
+        printf "${RC}Failed to start SSH agent${NC}\n"
+        return 1
+    }
+
+    . "$temp_env"
+    mv "$temp_env" "$AGENT_ENV"
+    chmod 600 "$AGENT_ENV"
+
+    printf "${GC}New SSH agent initialized (PID: $SSH_AGENT_PID)${NC}\n"
+    return 0
+}
+
+# Terminates all xkeys-managed SSH agents
+kill_xkeys_agents() {
+    printf "Searching for running SSH agents...\\n"
+
+    # Iterate over all SSH agents belonging to the current user
+    ps -u "$(whoami)" -o pid,command | grep "ssh-agent" | grep "\/xkeys-$UID\/agent" | while read -r pid cmd; do
+        printf "${GC}Found xkeys SSH agent (PID: $pid) with command: $cmd.${NC}\n"
+
+        # Kill the process
+        if [ -n "$pid" ] && ps -p "$pid" > /dev/null 2>&1; then
+            printf "${GC}Killing xkeys agent (PID: $pid).${NC}\n"
+            kill "$pid" >/dev/null 2>&1
+
+            # Verify if the process was successfully terminated
+            if ps -p "$pid" > /dev/null 2>&1; then
+                printf "${RC}Failed to kill xkeys agent (PID: $pid).${NC}\n"
+            else
+                printf "${GC}Successfully killed xkeys agent (PID: $pid).${NC}\n"
+            fi
+        else
+            printf "${RC}No running process found for PID: $pid.${NC}\n"
+        fi
+    done
+
+    # Clean up agent environment files
+    if [ -d "$TMP_DIR" ]; then
+        printf "Cleaning agent environment files in: $TMP_DIR\\n"
+        for agent_env in "$TMP_DIR"/.xssh.agent*; do
+            if [ -f "$agent_env" ]; then
+                printf "Removing environment file: $agent_env\\n"
+                safe_delete "$agent_env" "$TMP_PATTERN" "600"
+            fi
+        done
+    else
+        printf "${RC}Temporary directory not found: $TMP_DIR.${NC}\\n"
+    fi
+
+    # Remove agent directories
+    if [ -d "$TMP_DIR" ]; then
+        printf "Cleaning agent directories in: $TMP_DIR\\n"
+        find "$TMP_DIR" -maxdepth 1 -type d -path "$TMP_DIR/agent.*" | while read -r dir; do
+            if [ -z "$(ls -A "$dir")" ]; then
+                printf "Removing empty directory: $dir\\n"
+                safe_delete_dir "$dir" "$TMP_PATTERN"
+            fi
+        done
+        printf "${GC}Cleaned up agent directories.${NC}\\n"
+    fi
+
+    # Unset global SSH agent variables
+    unset SSH_AUTH_SOCK SSH_AGENT_PID
+    printf "${GC}All SSH agents have been terminated and cleaned up.${NC}\\n"
+}
+
+# Adds an SSH key to the agent
+add_key_to_agent() {
+    local key_path="$1"
+    local passphrase="$2"
+
+    log_debug "Adding key: $key_path"
+    log_debug "Passphrase length: ${#passphrase}"
+
+    if [ -f "$AGENT_ENV" ]; then
+        . "$AGENT_ENV" >/dev/null 2>&1
+        log_debug "Agent environment sourced: SSH_AUTH_SOCK=$SSH_AUTH_SOCK"
+    else
+        log_debug "No agent environment file found at $AGENT_ENV"
+    fi
+
+    if ! command -v expect >/dev/null 2>&1; then
+        printf "${RC}Error: 'expect' is required but not installed${NC}\n"
+        return 1
+    fi
+
+    local tmpfile
+    tmpfile=$(mktemp) || {
+        log_debug "Failed to create temp file"
+        printf "${RC}Error: Failed to create temp file${NC}\n"
+        return 1
+    }
+    TEMP_FILES+=("$tmpfile")
+    log_debug "Created temporary expect script: $tmpfile"
+
+    # Create expect script with proper variable escaping and error handling
+    cat > "$tmpfile" << 'EXPECT_EOF'
+#!/usr/bin/expect -f
+set timeout 10
+
+if {[llength $argv] < 2} {
+    puts "ERROR: Insufficient arguments"
+    exit 1
+}
+
+set key_path [lindex $argv 0]
+set pass [lindex $argv 1]
+
+# Disable output except for our controlled messages
+log_user 0
+
+proc cleanup {} {
+    global spawn_id
+    if {[info exists spawn_id]} {
+        catch {close}
+        catch {wait}
+    }
+}
+
+# Spawn ssh-add with the key
+spawn ssh-add $key_path
+
+expect {
+    "Enter passphrase for*" {
+        # Send passphrase and wait for response
+        send -- "$pass\r"
+        expect {
+            "Identity added*" {
+                puts "SUCCESS"
+                cleanup
+                exit 0
+            }
+            "Bad passphrase*" {
+                puts "BAD_PASSPHRASE"
+                cleanup
+                exit 2
+            }
+            timeout {
+                puts "TIMEOUT"
+                cleanup
+                exit 1
+            }
+            eof {
+                puts "ERROR_EOF"
+                cleanup
+                exit 1
+            }
+        }
+    }
+    "Identity added*" {
+        puts "SUCCESS"
+        cleanup
+        exit 0
+    }
+    "Could not open*" {
+        puts "ERROR_FILE"
+        cleanup
+        exit 1
+    }
+    timeout {
+        puts "TIMEOUT"
+        cleanup
+        exit 1
+    }
+    eof {
+        # Check exit status
+        if {[catch {wait} result]} {
+            puts "ERROR_WAIT"
+            exit 1
+        }
+        if {[lindex $result 3] == 0} {
+            puts "SUCCESS"
+            exit 0
+        } else {
+            puts "ERROR_STATUS [lindex $result 3]"
+            exit [lindex $result 3]
+        }
+    }
+}
+EXPECT_EOF
+
+    chmod 700 "$tmpfile"
+    log_debug "Set permissions on expect script"
+
+    # Run expect script and capture output
+    local output
+    output=$(expect "$tmpfile" "$key_path" "$passphrase" 2>&1)
+    local status=$?
+    log_debug "Expect output: $output"
+    log_debug "Expect status: $status"
+
+    # Clean up temporary file
+    safe_delete "$tmpfile"
+    log_debug "Cleaned up temporary files"
+
+    # Check for specific expect script output messages
+    case "$output" in
+        *SUCCESS*)
+            printf "${GC}SSH key '%s' added successfully${NC}\n" "$key_path"
+            return 0
+            ;;
+        *BAD_PASSPHRASE*)
+            printf "${RC}Error: Invalid passphrase for %s${NC}\n" "$key_path"
+            return 1
+            ;;
+        *TIMEOUT*)
+            printf "${RC}Error: Operation timed out while adding %s${NC}\n" "$key_path"
+            return 1
+            ;;
+        *ERROR_FILE*)
+            printf "${RC}Error: Could not open key file %s${NC}\n" "$key_path"
+            return 1
+            ;;
+        *)
+            printf "${RC}Error: Failed to add key %s (status: %d)${NC}\n" "$key_path" "$status"
+            return 1
+            ;;
+    esac
+}
+add_key_to_agent_expect() {
+    local key_path="$1"
+    local passphrase="$2"
+
+    log_debug "Adding key: $key_path"
+    log_debug "Passphrase length: ${#passphrase}"
+
+    if [ -f "$AGENT_ENV" ]; then
+        . "$AGENT_ENV" >/dev/null 2>&1
+    fi
+
+    if ! command -v expect >/dev/null 2>&1; then
+        printf "${RC}Error: 'expect' is required but not installed${NC}\n"
+        return 1
+    fi
+
+    local tmpfile=$(mktemp)
+    TEMP_FILES+=("$tmpfile")
+    log_debug "Created temporary expect script: $tmpfile"
+
+    cat > "$tmpfile" << 'EOF'
+#!/usr/bin/expect -f
+set timeout 10
+set key_path [lindex $argv 0]
+set passphrase [lindex $argv 1]
+
+spawn ssh-add $key_path
+expect {
+    "Enter passphrase for $key_path:" {
+        send "$passphrase\r"
+        expect "Identity added" {
+            exit 0
+        }
+    }
+    "Identity added" {
+        exit 0
+    }
+    timeout {
+        puts "Timeout waiting for ssh-add"
+        exit 1
+    }
+    eof {
+        catch wait result
+        exit [lindex $result 3]
+    }
+}
+EOF
+    chmod 700 "$tmpfile"
+
+    expect "$tmpfile" "$key_path" "$passphrase" 2>/dev/null
+    local status=$?
+
+    safe_delete "$tmpfile"
+
+    if [ $status -eq 0 ]; then
+        printf "${GC}SSH key '%s' added to the agent.${NC}\n" "$key_path"
+        return 0
+    else
+        printf "${RC}Error: Failed to add key %s (status: %d)${NC}\n" "$key_path" "$status"
+        return 1
+    fi
+}
+add_key_to_agent_disk() {
+    local key_path="$1"
+    local passphrase="$2"
+
+    log_debug "Adding key: $key_path"
+    log_debug "Passphrase length: ${#passphrase}"
+
+    if [ -f "$AGENT_ENV" ]; then
+        . "$AGENT_ENV" >/dev/null 2>&1
+    fi
+
+    local tmpfile=$(mktemp)
+    chmod 700 "$tmpfile"
+    TEMP_FILES+=("$tmpfile")
+
+    cat > "$tmpfile" << EOF
+#!/bin/bash
+echo "$passphrase"
+EOF
+
+    DISPLAY="none" SSH_ASKPASS="$tmpfile" ssh-add "$key_path" </dev/null 2>/dev/null
+    local status=$?
+
+    safe_delete "$tmpfile"
+
+    if [ $status -eq 0 ]; then
+        printf "${GC}SSH key '%s' added to the agent.${NC}\n" "$key_path"
+        return 0
+    else
+        printf "${RC}Error: Failed to add key %s (status: %d)${NC}\n" "$key_path" "$status"
+        return 1
+    fi
+}
+
+# Cleans up temporary files and directories while preserving key configuration
+clean_xkeys() {
+    local force="$1"
+    local cleaned=0
+    local total=0
+
+    # Clean up agent environment if not active
+    if [ -f "$AGENT_ENV" ]; then
+        . "$AGENT_ENV" >/dev/null 2>&1
+        if ! ps -p "$SSH_AGENT_PID" >/dev/null 2>&1 || [ "$force" = "--force" ]; then
+            safe_delete_agent_file "$AGENT_ENV" && {
+                printf "${GC}Removed stale agent environment file${NC}\n"
+                ((cleaned++))
+            }
+        fi
+        ((total++))
+    fi
+
+    # Clean up runtime directory
+    if [ -d "$TMP_DIR" ]; then
+        find "$TMP_DIR" -maxdepth 1 -type s -name "agent.*" | while read -r socket; do
+            ((total++))
+            if [ ! -S "$socket" ] || ! lsof "$socket" >/dev/null 2>&1 || [ "$force" = "--force" ]; then
+                if safe_delete "$socket" "$TMP_PATTERN" "600"; then
+                    printf "${GC}Removed socket: %s${NC}\n" "$socket"
+                    ((cleaned++))
+                fi
+            fi
+        done
+    fi
+
+    # Clean up orphaned passphrase files
+    if [ -d "$KEYS_ENC" ]; then
+        find "$KEYS_ENC" -type f -name "*.enc" | while read -r pfile; do
+            ((total++))
+            local found=0
+            for key_link in "$KEYS_DIR"/*; do
+                [ -L "$key_link" ] || continue
+                key_path=$(readlink -f "$key_link")
+                if [ "$(key_checksum "$key_path")" = "$(basename "$pfile" .enc)" ]; then
+                    found=1
+                    break
+                fi
+            done
+            if [ "$found" -eq 0 ] || [ "$force" = "--force" ]; then
+                if safe_delete_passphrase "$pfile"; then
+                    printf "${GC}Removed orphaned passphrase file: %s${NC}\n" "$pfile"
+                    ((cleaned++))
+                fi
+            fi
+        done
+    fi
+
+    printf "${GC}Cleanup complete. Cleaned %d of %d items.${NC}\n" "$cleaned" "$total"
+}
+
+# Completely purges all xkeys data and configuration
+purge_xkeys() {
+    [ "$1" != "--force" ] && {
+        printf "${RC}Error: This operation requires --force flag${NC}\n"
+        return 1
+    }
+
+    printf "${GY}Starting complete xkeys purge...${NC}\n"
+    kill_xkeys_agents
+    clean_xkeys "--force"
+
+    # Purge runtime directory
+    [ -d "$TMP_DIR" ] && {
+        safe_delete_dir "$TMP_DIR" "$TMP_PATTERN"
+        mkdir -p "$TMP_DIR"
+        chmod 700 "$TMP_DIR"
+        printf "${GC}Purged and recreated runtime directory${NC}\n"
+    }
+
+    # Remove managed keys silently if no symlinks found
+    [ -d "$KEYS_DIR" ] && {
+        find "$KEYS_DIR" -type l -exec safe_delete_link {} \; 2>/dev/null
+        safe_delete_dir "$KEYS_DIR" "$KEYS_PATTERN"
+        mkdir -p "$KEYS_DIR"
+        chmod 700 "$KEYS_DIR"
+        printf "${GC}Purged and recreated keys directory${NC}\n"
+    }
+
+    # Remove encrypted passphrases
+    [ -d "$KEYS_ENC" ] && {
+        # Check if there are any .enc files before trying to delete them
+        if find "$KEYS_ENC" -type f -name "*.enc" | grep -q .; then
+            find "$KEYS_ENC" -type f -name "*.enc" -exec safe_delete_passphrase {} \;
+        fi
+        safe_delete_dir "$KEYS_ENC" "$ENC_PATTERN"
+        mkdir -p "$KEYS_ENC"
+        chmod 700 "$KEYS_ENC"
+        printf "${GC}Purged and recreated encrypted passphrases directory${NC}\n"
+    }
+
+    printf "${GC}xkeys purge complete. All data has been removed.${NC}\n"
+    return 0
+}
+
+# Function to set up encrypted passphrase for a key
+setup_passphrase() {
+    local key_path="$1"
+    local passphrase_file="$KEYS_ENC/$(key_checksum "$key_path").enc"
+
+    # Verify that the passphrase file is writable or can be created
+    if [ -e "$passphrase_file" ]; then
+        if [ ! -w "$passphrase_file" ]; then
+            printf "${RC}Error: Cannot write to passphrase file: $passphrase_file.${NC}\n"
+            return 1
+        fi
+    else
+        # Ensure the directory exists and has correct permissions
+        mkdir -p "$KEYS_ENC" || {
+            printf "${RC}Error: Could not create passphrases directory${NC}\n"
+            return 1
+        }
+        [ -w "$KEYS_ENC" ] || {
+            printf "${RC}Error: No write access to passphrases directory${NC}\n"
+            return 1
+        }
+        chmod 700 "$KEYS_ENC"
+    fi
+
+    printf "Enter SSH key passphrase for %s: " "$key_path"
+    read -s ssh_passphrase
+    echo
+
+    if ! ssh-keygen -y -f "$key_path" -P "$ssh_passphrase" >/dev/null 2>&1; then
+        printf "${RC}Error: Invalid SSH key passphrase${NC}\n"
+        return 1
+    fi
+
+    if [ -z "$MASTER_PASSWORD_CACHE" ]; then
+        printf "Enter Master Password to encrypt this key: "
+        read -s master_password
+        echo
+        MASTER_PASSWORD_CACHE="$master_password"
+    fi
+
+    local kek
+    kek=$(derive_kek "$MASTER_PASSWORD_CACHE")
+
+    # Direct pipe to openssl, no temp files
+    echo -n "$ssh_passphrase" | openssl enc -aes-256-cbc -salt -pbkdf2 -iter 10000 -md sha256 -k "$kek" -out "$passphrase_file" || {
+        printf "${RC}Error: Failed to save passphrase to $passphrase_file.${NC}\n"
+        return 1
+    }
+    chmod 400 "$passphrase_file"
+    printf "${GC}Passphrase for %s encrypted and saved.${NC}\n" "$key_path"
+    return 0
+}
+
+# Function to decrypt and retrieve passphrase for a key
+retrieve_passphrase() {
+    local key_path="$1"
+    local passphrase_file="$KEYS_ENC/$(key_checksum "$key_path").enc"
+
+    if [ ! -f "$passphrase_file" ]; then
+        log_debug "Passphrase file not found: $passphrase_file"
+        return 1
+    fi
+
+    if [ -z "$MASTER_PASSWORD_CACHE" ]; then
+        printf "Enter Master Password to decrypt passphrase for %s: " "$key_path" >&2
+        read -s master_password
+        echo >&2
+        MASTER_PASSWORD_CACHE="$master_password"
+    fi
+
+    local kek
+    kek=$(derive_kek "$MASTER_PASSWORD_CACHE")
+
+    # Direct decryption without temp files
+    decrypted_passphrase=$(openssl enc -d -aes-256-cbc -pbkdf2 -iter 10000 -md sha256 -k "$kek" -in "$passphrase_file" 2>/dev/null)
+    [ $? -eq 0 ] || return 1
+
+    echo -n "$decrypted_passphrase"
+}
+
+# Function to scan for SSH keys in a directory
+scan_ssh_keys() {
+    local scan_dir="${1:-$SSH_DIR}"
+    local key_pattern='id_*'
+    local max_path_len=50  # Default minimum width for key paths
+
+    # Find all matching key files recursively and calculate the maximum path length
+    local longest_path=$(find "$scan_dir" -type f -name "$key_pattern" ! -name "*.pub" 2>/dev/null | while read -r key_file; do
+        key_file=$(readlink -f "$key_file")  # Resolve to absolute path
+        echo "${#key_file}"
+    done | sort -nr | head -n1)
+    max_path_len=$((longest_path > max_path_len ? longest_path : max_path_len))
+
+    printf "Scanning for SSH keys in: %s (recursively)\n" "$scan_dir"
+
+    # Print table header with dynamic width
+    printf "%-${max_path_len}s %-10s %-10s %-10s\n" "Key Path" "Security" "Status" "Agent"
+    printf "%-${max_path_len}s %-10s %-10s %-10s\n" "$(printf '%*s' "$max_path_len" | tr ' ' '-')" "----------" "----------" "----------"
+
+    # Process each matching key file
+    find "$scan_dir" -type f -name "$key_pattern" ! -name "*.pub" 2>/dev/null | while read -r key_file; do
+        key_file=$(readlink -f "$key_file")  # Normalize to absolute path
+
+        # Check if the file is a valid SSH private key
+        if ! grep -q "PRIVATE KEY" "$key_file" 2>/dev/null; then
+            continue
+        fi
+
+        # Determine security status without triggering passphrase prompts
+        local security status agent
+        if ssh-keygen -y -f "$key_file" -P "" >/dev/null 2>&1; then
+            security="${RC}PLAIN     ${NC}"
+        else
+            security="${GC}ENCRYPTED ${NC}"
+        fi
+
+        # Ensure symlink exists in KEYS_DIR and points to the actual key file
+        if [ -L "$KEYS_DIR/$(basename "$key_file")" ] && [ "$(readlink -f "$KEYS_DIR/$(basename "$key_file")")" = "$key_file" ]; then
+            status="${GC}ADDED     ${NC}"
+        else
+            status="${RC}FREE      ${NC}"
+        fi
+
+        # Check agent status only if the agent is running
+        if check_ssh_agent; then
+            if ssh-add -l 2>/dev/null | grep -q "$(ssh-keygen -l -f "$key_file" 2>/dev/null | awk '{print $2}')"; then
+                agent="${GC}LOADED     ${NC}"
+            else
+                agent="${RC}FREE       ${NC}"
+            fi
+        else
+            agent="${RC}NO AGENT   ${NC}"
+        fi
+
+        # Print the key details with dynamic alignment
+        printf "%-${max_path_len}s %-10b %-10b %-10b\n" "$key_file" "$security" "$status" "$agent"
+    done
+}
+
+# Function to verify all encrypted keys and passphrases
+verify_keys() {
+    printf "Enter Master Password to verify keys: "
+    read -s master_password
+    echo
+
+    local kek
+    kek=$(derive_kek "$master_password")
+
+    local success=0
+    local total=0
+
+    for key_link in "$KEYS_DIR"/*; do
+        [ -L "$key_link" ] || continue
+        total=$((total + 1))
+        key_path=$(readlink -f "$key_link")
+
+        # Skip unencrypted keys
+        if ssh-keygen -y -f "$key_path" -P "" >/dev/null 2>&1; then
+            printf "${RC}WARNING: Unencrypted key found: %s${NC}\n" "$key_path"
+            continue
+        fi
+
+        local passphrase_file="$KEYS_ENC/$(key_checksum "$key_path").enc"
+        [ -f "$passphrase_file" ] || {
+            printf "${RC}ERROR: Missing passphrase file for: %s${NC}\n" "$key_path"
+            continue
+        }
+
+        [ "$(stat -L -c "%a" "$passphrase_file")" = "400" ] || {
+            printf "${RC}ERROR: Invalid permissions on passphrase file: %s${NC}\n" "$passphrase_file"
+            continue
+        }
+
+        # Decrypt and verify without temp files
+        decrypted_passphrase=$(openssl enc -d -aes-256-cbc -pbkdf2 -iter 10000 -md sha256 -k "$kek" -in "$passphrase_file" 2>/dev/null) || {
+            printf "${RC}ERROR: Failed to decrypt passphrase for: %s${NC}\n" "$key_path"
+            continue
+        }
+
+        if ssh-keygen -y -f "$key_path" -P "$decrypted_passphrase" >/dev/null 2>&1; then
+            ((success++))
+            printf "${GC}Verified: %s${NC}\n" "$key_path"
+        else
+            printf "${RC}ERROR: Invalid passphrase for: %s${NC}\n" "$key_path"
+        fi
+    done
+
+    printf "\nVerified %d of %d keys.\n" "$success" "$total"
+    return $([ "$success" -eq "$total" ])
+}
+
+# Load all keys from the managed directory into the agent
+load_all_keys() {
+    if ! check_ssh_agent; then
+        init_ssh_agent || return 1
+    fi
+
+    local success=0
+    local total=0
+
+    for key_link in "$KEYS_DIR"/*; do
+        [ -L "$key_link" ] || continue
+        total=$((total + 1))
+        key_path=$(readlink -f "$key_link")
+
+        if ssh-keygen -y -f "$key_path" -P "" >/dev/null 2>&1; then
+            # Non-encrypted key
+            if ssh-add "$key_path" >/dev/null 2>&1; then
+                success=$((success + 1))
+                printf "${GC}Added non-encrypted key: %s${NC}\n" "$key_path"
+            fi
+        else
+            # Encrypted key
+            local passphrase
+            if passphrase=$(retrieve_passphrase "$key_path"); then
+                if add_key_to_agent "$key_path" "$passphrase"; then
+                    success=$((success + 1))
+                fi
+            fi
+        fi
+    done
+
+    printf "Successfully loaded %d of %d keys.\n" "$success" "$total"
+    [ "$success" -eq "$total" ]
+}
+
+rm_key() {
+    local key_path="$1"
+    local key_link="$KEYS_DIR/$(basename "$key_path")"
+    local passphrase_file="$KEYS_ENC/$(key_checksum "$key_path").enc"
+
+    # Verify key is registered
+    if [ ! -L "$key_link" ] || [ "$(readlink -f "$key_link")" != "$key_path" ]; then
+        printf "${RC}Error: Key not registered: %s${NC}\n" "$key_path"
+        return 1
+    fi
+
+    # Remove from agent if loaded
+    if ssh-add -l 2>/dev/null | grep -q "$(ssh-keygen -l -f "$key_path" 2>/dev/null | awk '{print $2}')"; then
+        ssh-add -d "$key_path" >/dev/null 2>&1
+    fi
+
+    # Remove symlink and passphrase
+    unlink "$key_link"
+    [ -f "$passphrase_file" ] && safe_delete_passphrase "$passphrase_file"
+
+    printf "${GC}Key removed: %s${NC}\n" "$key_path"
+    return 0
+}
+
+change_master_password() {
+    printf "Enter current Master Password: "
+    read -s current_password
+    echo
+
+    printf "Enter new Master Password: "
+    read -s new_password
+    echo
+    printf "Confirm new Master Password: "
+    read -s confirm_password
+    echo
+
+    [ "$new_password" = "$confirm_password" ] || {
+        printf "${RC}Error: New passwords do not match.${NC}\n"
+        return 1
+    }
+
+    local old_kek new_kek
+    old_kek=$(derive_kek "$current_password")
+    new_kek=$(derive_kek "$new_password")
+
+    local success=0
+    local total=0
+
+    for passphrase_file in "$KEYS_ENC"/*.enc; do
+        [ -f "$passphrase_file" ] || continue
+        ((total++))
+
+        # Decrypt and immediately re-encrypt without temp files
+        decrypted_passphrase=$(openssl enc -d -aes-256-cbc -pbkdf2 -iter 10000 -md sha256 -k "$old_kek" -in "$passphrase_file" 2>/dev/null) || continue
+
+        new_file="${passphrase_file}.new"
+        echo -n "$decrypted_passphrase" | openssl enc -aes-256-cbc -salt -pbkdf2 -iter 10000 -md sha256 -k "$new_kek" -out "$new_file" || {
+            safe_delete "$new_file"
+            continue
+        }
+
+        chmod 400 "$new_file"
+        if mv "$new_file" "$passphrase_file"; then
+            ((success++))
+        else
+            safe_delete "$new_file"
+        fi
+    done
+
+    if [ "$success" -eq "$total" ]; then
+        printf "${GC}Master Password updated for all keys (%d of %d).${NC}\n" "$success" "$total"
+        return 0
+    else
+        printf "${RC}Warning: Only updated %d of %d keys.${NC}\n" "$success" "$total"
+        return 1
+    fi
+}
+
+# Add key to xkeys management
+_xkeys_add() {
+    local key_path="$1"
+    local sanitized_path
+
+    sanitized_path=$(validate_ssh_key "$key_path") || {
+        printf "${RC}Error: Invalid SSH key path${NC}\n"
+        return 1
+    }
+
+    local key_name=$(basename "$sanitized_path")
+    local target_link="$KEYS_DIR/$key_name"
+    local passphrase_file="$KEYS_ENC/$(key_checksum "$sanitized_path").enc"
+
+    # Check if key is already registered
+    if [[ -L "$target_link" && "$(readlink -f "$target_link")" == "$sanitized_path" ]]; then
+        printf "${GY}Key '%s' is already registered.${NC}\n" "$sanitized_path"
+        
+        # If passphrase exists, try to load the key
+        if [[ -f "$passphrase_file" ]]; then
+            if ! check_ssh_agent; then
+                init_ssh_agent || return 1
+            fi
+            
+            # Try to retrieve the passphrase
+            local passphrase
+            if ! passphrase=$(retrieve_passphrase "$sanitized_path"); then
+                # If retrieval failed, re-encrypt with new master password
+                printf "Enter SSH key passphrase for %s: " "$sanitized_path"
+                read -s ssh_passphrase
+                echo
+
+                if ! ssh-keygen -y -f "$sanitized_path" -P "$ssh_passphrase" >/dev/null 2>&1; then
+                    printf "${RC}Error: Invalid SSH key passphrase${NC}\n"
+                    return 1
+                fi
+
+                printf "Enter Master Password to encrypt this key: "
+                read -s master_password
+                echo
+                MASTER_PASSWORD_CACHE="$master_password"
+
+                local kek
+                kek=$(derive_kek "$MASTER_PASSWORD_CACHE")
+
+                # Remove existing passphrase file and create new one
+                safe_delete_passphrase "$passphrase_file"
+                echo -n "$ssh_passphrase" | openssl enc -aes-256-cbc -salt -pbkdf2 -iter 10000 -md sha256 -k "$kek" -out "$passphrase_file" || {
+                    printf "${RC}Error: Failed to save passphrase${NC}\n"
+                    return 1
+                }
+                chmod 400 "$passphrase_file"
+                printf "${GC}Passphrase for %s re-encrypted and saved.${NC}\n" "$sanitized_path"
+                passphrase="$ssh_passphrase"
+            fi
+
+            if add_key_to_agent "$sanitized_path" "$passphrase"; then
+                printf "${GC}Key loaded successfully.${NC}\n"
+                return 0
+            fi
+            printf "${RC}Failed to load existing key.${NC}\n"
+            return 1
+        fi
+    fi
+
+    # Continue with normal key addition for new keys...
+    ln -sfT "$sanitized_path" "$target_link" || {
+        printf "${RC}Error: Failed to register key${NC}\n"
+        return 1
+    }
+
+    printf "${GC}Key '%s' registered.${NC}\n" "$sanitized_path"
+
+    local ssh_passphrase=""
+    if ! ssh-keygen -y -f "$sanitized_path" -P "" >/dev/null 2>&1; then
+        printf "Enter SSH key passphrase for %s: " "$sanitized_path"
+        read -s ssh_passphrase
+        echo
+
+        if ! ssh-keygen -y -f "$sanitized_path" -P "$ssh_passphrase" >/dev/null 2>&1; then
+            printf "${RC}Error: Invalid SSH key passphrase${NC}\n"
+            return 1
+        fi
+
+        printf "Enter Master Password to encrypt this key: "
+        read -s master_password
+        echo
+        MASTER_PASSWORD_CACHE="$master_password"
+
+        local kek
+        kek=$(derive_kek "$MASTER_PASSWORD_CACHE")
+
+        echo -n "$ssh_passphrase" | openssl enc -aes-256-cbc -salt -pbkdf2 -iter 10000 -md sha256 -k "$kek" -out "$passphrase_file" || {
+            printf "${RC}Error: Failed to save passphrase${NC}\n"
+            return 1
+        }
+        chmod 400 "$passphrase_file"
+        printf "${GC}Passphrase for %s encrypted and saved.${NC}\n" "$sanitized_path"
+    else
+        printf "${GY}Warning: Non-encrypted key registered${NC}\n"
+    fi
+
+    # Initialize agent if needed
+    if ! check_ssh_agent; then
+        init_ssh_agent || return 1
+    fi
+
+    # Add the key to the agent
+    if [[ -n "$ssh_passphrase" ]]; then
+        add_key_to_agent "$sanitized_path" "$ssh_passphrase" && {
+            printf "${GC}Successfully loaded key.${NC}\n"
+        }
+    else
+        ssh-add "$sanitized_path" >/dev/null 2>&1 && {
+            printf "${GC}Successfully loaded key.${NC}\n"
+        }
+    fi
+}
+
+# Remove key from xkeys management
+_xkeys_remove() {
+    local key_path="$1"
+    local sanitized_path
+
+    sanitized_path=$(validate_ssh_key "$key_path") || {
+        printf "${RC}Error: Invalid key path${NC}\n"
+        return 1
+    }
+
+    local key_link="$KEYS_DIR/$(basename "$sanitized_path")"
+    local passphrase_file="$KEYS_ENC/$(key_checksum "$sanitized_path").enc"
+
+    # Verify key is registered
+    [[ -L "$key_link" ]] && [[ "$(realpath "$key_link")" == "$sanitized_path" ]] || {
+        printf "${RC}Error: Key not registered: %s${NC}\n" "$sanitized_path"
+        return 1
+    }
+
+    # Remove from agent if loaded
+    if ssh-add -l 2>/dev/null | grep -q "$(ssh-keygen -l -f "$sanitized_path" 2>/dev/null | awk '{print $2}')"; then
+        ssh-add -d "$sanitized_path" >/dev/null 2>&1
+    fi
+
+    # Remove symlink and passphrase atomically
+    safe_delete "$key_link"
+    [[ -f "$passphrase_file" ]] && safe_delete_passphrase "$passphrase_file"
+
+    printf "${GC}Key removed: %s${NC}\n" "$sanitized_path"
+}
+
+# Main xkeys function
+xkeys() {
+    # Source agent environment at start of every xkeys command
+    if [ -f "$AGENT_ENV" ]; then
+        . "$AGENT_ENV"
+        export SSH_AUTH_SOCK SSH_AGENT_PID
+    fi
+
+    case "$1" in
+        add)
+            [[ -z "$2" ]] && {
+                printf "${RC}Error: Please specify a key path${NC}\n"
+                return 1
+            }
+            _xkeys_add "$2"
+            ;;
+        rm)
+            [[ -z "$2" ]] && {
+                printf "${RC}Error: Please specify a key path${NC}\n"
+                return 1
+            }
+            _xkeys_remove "$2"
+            ;;
+        load)
+            load_all_keys
+            ;;
+        ls|-l)
+            if check_ssh_agent; then
+                printf "${GC}SSH agent is running with the following keys:${NC}\n"
+                ssh-add -l
+            else
+                printf "${RC}No SSH agent running or no keys loaded${NC}\n"
+                return 1
+            fi
+            ;;
+        verify)
+            verify_keys
+            ;;
+        scan)
+            scan_ssh_keys "${2:-$SSH_DIR}"
+            ;;
+        kill)
+            kill_xkeys_agents
+            ;;
+        clean)
+            clean_xkeys "$2"
+            ;;
+        purge)
+            purge_xkeys "$2"
+            ;;
+        passwd)
+            change_master_password
+            ;;
+        *)
+            cat << EOF
+Enhanced SSH Agent Management with Multi-Key Support
+Usage: xkeys <command> [arguments]
+Commands:
+ ls               - Show SSH agent and registered keys status
+ scan [dir]       - Scan for SSH keys in directory (default: ~/.ssh)
+ add <key_path>   - Add key to xkeys management and load
+ rm  <key_path>   - Remove key from xkeys
+ load             - Load registered keys into agent
+ kill             - Stop agent and unload keys
+ clean [--force]  - Clean up temporary files (--force to remove all)
+ purge --force    - Remove all xkeys data (requires --force)
+ verify           - Verify keys integrity
+ passwd           - Change master password
+EOF
+            return 1
+            ;;
+    esac
+}
+
+# Command completion function
+_xkeys_complete() {
+    local cur prev commands
+    COMPREPLY=()
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+    commands="ls scan add rm load verify passwd kill clean purge"
+
+    case "${prev}" in
+        "xkeys")
+            # Complete command names
+            COMPREPLY=( $(compgen -W "${commands}" -- ${cur}) )
+            ;;
+        "add")
+           # Find SSH private key files and exclude .pub
+           local key_pattern='id_*[^.pub]'
+           if [ -d "$SSH_DIR" ]; then
+               local keys=()
+               while IFS= read -r key; do
+                   if grep -q "PRIVATE KEY" "$key" 2>/dev/null; then
+                       keys+=("$key")
+                   fi
+               done < <(find "$SSH_DIR" -type f -name "$key_pattern")
+               COMPREPLY=($(compgen -W "${keys[*]}" -- "${cur}"))
+           fi
+           ;;
+        "rm")
+            if [ -d "$KEYS_DIR" ]; then
+                local registered_keys=()
+                while IFS= read -r link; do
+                    if [ -L "$link" ]; then
+                        registered_keys+=("$(readlink -f "$link")")
+                    fi
+                done < <(find "$KEYS_DIR" -type l)
+                COMPREPLY=($(compgen -W "${registered_keys[*]}" -- "${cur}"))
+            fi
+            ;;
+        "scan"|"purge")
+            # Complete with directory paths
+            COMPREPLY=( $(compgen -d -- ${cur}) )
+            ;;
+        *)
+            COMPREPLY=()
+            ;;
+    esac
+
+    return 0
+}
+
+# Register completion function
+complete -F _xkeys_complete xkeys
+
+# When sourced, check and use existing agent if available
+check_ssh_agent
+
+# Export necessary functions
+export -f xkeys
