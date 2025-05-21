@@ -1,0 +1,990 @@
+#!/bin/bash
+
+# ANSI color codes for better formatting
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+YELLOW='\033[0;33m'
+RED='\033[0;31m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m' # No Color
+
+# Check if we should filter by username
+filter_user=""
+clean_only=false
+verbose=false
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -u|--user)
+      filter_user="$2"
+      shift 2
+      ;;
+    -c|--clean)
+      clean_only=true
+      shift
+      ;;
+    -v|--verbose)
+      verbose=true
+      shift
+      ;;
+    -h|--help)
+      echo "Usage: $(basename $0) [options]"
+      echo "Options:"
+      echo "  -u, --user USERNAME   Filter results for specific user"
+      echo "  -c, --clean           Only clean stale sockets without showing details"
+      echo "  -v, --verbose         Show extended information from /proc filesystem"
+      echo "  -h, --help            Show this help message"
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1"
+      echo "Use -h or --help for usage information"
+      exit 1
+      ;;
+  esac
+done
+
+# Function to sanitize command line output
+sanitize_cmd() {
+  local cmd="$1"
+  
+  # Replace null bytes with spaces
+  cmd=$(echo "$cmd" | tr -d '\000')
+  
+  # Look for repeated patterns of whitespace or padding characters
+  if [[ "$cmd" == *"[mux]"* ]]; then
+    # For multiplexer commands, use a special approach - only show first 100 chars if very long
+    if [ ${#cmd} -gt 200 ]; then
+      # Check for repeated patterns
+      local pattern=$(echo "$cmd" | grep -o ".\{20\}" | head -1)
+      if [[ $(echo "$cmd" | grep -o "$pattern" | wc -l) -gt 3 ]]; then
+        # Found a repeating pattern, truncate it
+        local before_pattern="${cmd%%$pattern*}"
+        local after_pattern="${cmd##*$pattern}"
+        cmd="$before_pattern$pattern [repeated pattern truncated] $after_pattern"
+      else
+        # No clear repeating pattern, just keep important parts
+        local mux_part=$(echo "$cmd" | grep -o ".*\[mux\]")
+        cmd="$mux_part [additional content truncated]"
+      fi
+    fi
+  else
+    # For regular commands, collapse sequences of spaces but preserve content
+    cmd=$(echo "$cmd" | tr -s ' ')
+  fi
+  
+  echo "$cmd"
+}
+
+# Function to get verbose information for a process
+show_verbose_process_info() {
+    local pid=$1
+
+    echo -e "  ${CYAN}=== EXTENDED PROCESS INFORMATION ===${NC}"
+
+    # Full command line
+    echo -e "  ${YELLOW}Full command line:${NC}"
+    if [[ -f "/proc/$pid/cmdline" ]]; then
+        cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline")
+        # Sanitize the command
+        cmd=$(sanitize_cmd "$cmd")
+        echo -e "    $cmd"
+    else
+        echo -e "    Unable to read command line"
+    fi
+
+    # Working directory
+    echo -e "  ${YELLOW}Working directory:${NC}"
+    if [[ -h "/proc/$pid/cwd" ]]; then
+        cwd=$(readlink "/proc/$pid/cwd")
+        echo -e "    $cwd"
+    else
+        echo -e "    Unable to read working directory"
+    fi
+
+    # Environment variables
+    echo -e "  ${YELLOW}SSH-related environment variables:${NC}"
+    if [[ -f "/proc/$pid/environ" ]]; then
+        env_vars=$(tr '\0' '\n' < "/proc/$pid/environ" | grep -E '^(SSH_|USER=|HOME=|SUDO_|LOGNAME=)')
+        if [[ -n "$env_vars" ]]; then
+            echo "$env_vars" | sed 's/^/    /'
+        else
+            echo "    No SSH-related environment variables found"
+        fi
+    else
+        echo "    Unable to read environment variables"
+    fi
+
+    # File descriptors
+    echo -e "  ${YELLOW}Key file descriptors:${NC}"
+    if [[ -d "/proc/$pid/fd" ]]; then
+        fds=$(ls -la /proc/$pid/fd 2>/dev/null | grep -E 'socket:|\.ssh|pts')
+        if [[ -n "$fds" ]]; then
+            echo "$fds" | sed 's/^/    /'
+        else
+            echo "    No SSH-related file descriptors found"
+        fi
+    else
+        echo "    Unable to read file descriptors"
+    fi
+
+    # Check for SSH authentication
+    echo -e "  ${YELLOW}SSH authentication:${NC}"
+    if [[ -f "/proc/$pid/environ" ]]; then
+        ssh_auth_sock=$(tr '\0' '\n' < "/proc/$pid/environ" | grep "^SSH_AUTH_SOCK=" | cut -d= -f2)
+        if [[ -n "$ssh_auth_sock" && -S "$ssh_auth_sock" ]]; then
+            echo "    Using SSH agent with socket: $ssh_auth_sock"
+            ssh_agent_pid=$(tr '\0' '\n' < "/proc/$pid/environ" | grep "^SSH_AGENT_PID=" | cut -d= -f2)
+            if [[ -n "$ssh_agent_pid" ]]; then
+                echo "    Agent PID: $ssh_agent_pid"
+            fi
+        elif [[ -f "/proc/$pid/cmdline" ]]; then
+            cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline")
+            cmd=$(sanitize_cmd "$cmd")
+            if [[ "$cmd" == *"-i "* ]]; then
+                key_file=$(echo "$cmd" | grep -o -- "-i [^ ]*" | cut -d' ' -f2)
+                echo "    Using identity file: $key_file"
+            else
+                echo "    Likely using password authentication or default keys"
+            fi
+        else
+            echo "    Authentication method unknown"
+        fi
+    else
+        echo "    Unable to determine authentication method"
+    fi
+
+    # Port forwarding
+    if [[ -f "/proc/$pid/cmdline" ]]; then
+        cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline")
+        cmd=$(sanitize_cmd "$cmd")
+        if [[ "$cmd" == *"-L "* || "$cmd" == *"-R "* || "$cmd" == *"-D "* ]]; then
+            echo -e "  ${YELLOW}Port forwarding:${NC}"
+            if [[ "$cmd" == *"-L "* ]]; then
+                local_fwd=$(echo "$cmd" | grep -o -- "-L [^ ]*")
+                echo "    Local forwarding: $local_fwd"
+            fi
+            if [[ "$cmd" == *"-R "* ]]; then
+                remote_fwd=$(echo "$cmd" | grep -o -- "-R [^ ]*")
+                echo "    Remote forwarding: $remote_fwd"
+            fi
+            if [[ "$cmd" == *"-D "* ]]; then
+                dynamic_fwd=$(echo "$cmd" | grep -o -- "-D [^ ]*")
+                echo "    Dynamic forwarding: $dynamic_fwd"
+            fi
+        fi
+    fi
+}
+
+# Header with timestamp (skip if clean only)
+if ! $clean_only; then
+  echo -e "${BOLD}${BLUE}===== COMPREHENSIVE SSH CONNECTION ANALYSIS =====${NC}"
+  echo -e "${YELLOW}Date: $(date)${NC}"
+  if [[ -n "$filter_user" ]]; then
+    echo -e "${CYAN}Filtering for user: ${BOLD}$filter_user${NC}"
+  fi
+  if $verbose; then
+    echo -e "${CYAN}Verbose mode: ${BOLD}enabled${NC}"
+  fi
+  echo
+fi
+
+# Function to calculate how long ago a process started
+get_process_age() {
+    local pid=$1
+    local start_time=$(ps -o lstart= -p $pid 2>/dev/null)
+
+    if [ -n "$start_time" ]; then
+        local start_seconds=$(date -d "$start_time" +%s 2>/dev/null)
+        local now_seconds=$(date +%s)
+        local age_seconds=$((now_seconds - start_seconds))
+
+        # Format the age
+        if [ $age_seconds -lt 60 ]; then
+            echo "${age_seconds}s"
+        elif [ $age_seconds -lt 3600 ]; then
+            echo "$((age_seconds / 60))m $((age_seconds % 60))s"
+        elif [ $age_seconds -lt 86400 ]; then
+            echo "$((age_seconds / 3600))h $(((age_seconds % 3600) / 60))m"
+        else
+            echo "$((age_seconds / 86400))d $((age_seconds % 86400 / 3600))h"
+        fi
+    else
+        echo "unknown"
+    fi
+}
+
+# Function to determine if an SSH process is an outbound connection
+is_outbound_ssh() {
+    local pid=$1
+    local cmd=$2
+
+    # Check the command itself for outbound connection indicators
+    if [[ "$cmd" == "ssh "* || "$cmd" == *"/ssh "* || "$cmd" == *" ssh "* ]] && [[ "$cmd" != *"sshd"* ]]; then
+        # This is a ssh client command, not sshd server
+        return 0
+    fi
+
+    # Check if it has network connections to remote port 22
+    if ss -tnpo | grep -E ":[0-9]+ +[^:]+:22" | grep -q "pid=$pid"; then
+        return 0
+    fi
+
+    # Check for [mux] in the command which indicates a control master connection
+    if [[ "$cmd" == *"[mux]"* ]]; then
+        return 0
+    fi
+
+    return 1
+}
+
+# Check if a process or any of its parents match the filter user
+is_related_to_user() {
+    local check_pid="$1"
+    local target_user="$2"
+
+    # Check if the process itself belongs to the user
+    local proc_user=$(ps -o user= -p "$check_pid" 2>/dev/null)
+    if [[ "$proc_user" == "$target_user" ]]; then
+        return 0
+    fi
+
+    # Check up to 5 levels of parent processes
+    local current_pid="$check_pid"
+    for i in {1..5}; do
+        local parent_pid=$(ps -o ppid= -p "$current_pid" 2>/dev/null | tr -d ' ')
+        if [[ -z "$parent_pid" || "$parent_pid" -le 1 ]]; then
+            break
+        fi
+
+        local parent_user=$(ps -o user= -p "$parent_pid" 2>/dev/null)
+        if [[ "$parent_user" == "$target_user" ]]; then
+            return 0
+        fi
+
+        current_pid="$parent_pid"
+    done
+
+    # Check child processes (for cases where target user sudos to another user)
+    local children=$(pgrep -P "$check_pid" 2>/dev/null)
+    for child in $children; do
+        local child_user=$(ps -o user= -p "$child" 2>/dev/null)
+        if [[ "$child_user" == "$target_user" ]]; then
+            return 0
+        fi
+
+        # Check one more level of children
+        local grandchildren=$(pgrep -P "$child" 2>/dev/null)
+        for grandchild in $grandchildren; do
+            local grandchild_user=$(ps -o user= -p "$grandchild" 2>/dev/null)
+            if [[ "$grandchild_user" == "$target_user" ]]; then
+                return 0
+            fi
+        done
+    done
+
+    return 1
+}
+
+# Function to find sudo chain for a process
+get_sudo_chain() {
+    local start_pid="$1"
+    local chain=""
+    local current_pid="$start_pid"
+    local current_user=$(ps -o user= -p "$current_pid" 2>/dev/null)
+
+    chain="${BOLD}$current_user${NC}"
+
+    # Trace back up to 7 levels of parent processes to find sudo
+    for i in {1..7}; do
+        local parent_pid=$(ps -o ppid= -p "$current_pid" 2>/dev/null | tr -d ' ')
+        if [[ -z "$parent_pid" || "$parent_pid" -le 1 ]]; then
+            break
+        fi
+
+        local parent_cmd=$(ps -o cmd= -p "$parent_pid" 2>/dev/null)
+        local parent_user=$(ps -o user= -p "$parent_pid" 2>/dev/null)
+
+        if [[ -n "$parent_user" ]]; then
+            if [[ "$parent_cmd" == *"sudo"* ]]; then
+                chain="$chain → ${BOLD}$parent_user${NC}(sudo)"
+            else
+                chain="$chain → ${BOLD}$parent_user${NC}"
+            fi
+        fi
+
+        current_pid="$parent_pid"
+    done
+
+    echo "$chain"
+}
+
+# Store connection information for correlation
+declare -A pid_to_conn
+declare -A socket_to_pid
+declare -A outbound_pids
+
+# First gather all network connections
+if ! $clean_only; then
+    # Get all established connections
+    while read line; do
+        local_addr=$(echo "$line" | awk '{print $4}')
+        remote_addr=$(echo "$line" | awk '{print $5}')
+        pids=$(echo "$line" | grep -oP 'pid=\K[0-9]+')
+
+        # Check if this is an outbound connection to port 22
+        if [[ "$remote_addr" == *":22" ]]; then
+            # This is an outbound SSH connection
+            for pid in $pids; do
+                outbound_pids["$pid"]=1
+            done
+        fi
+
+        for pid in $pids; do
+            pid_to_conn["$pid"]="$local_addr → $remote_addr"
+        done
+    done < <(ss -tnpo state established | grep -v State)
+
+    # Also identify SSH client processes that might not have an active connection yet
+    while read line; do
+        pid=$(echo "$line" | awk '{print $2}')
+        cmd=$(echo "$line" | awk '{print $11 " " $12 " " $13 " " $14 " " $15}')
+
+        if is_outbound_ssh "$pid" "$cmd"; then
+            outbound_pids["$pid"]=1
+        fi
+    done < <(ps aux | grep ssh | grep -v grep)
+fi
+
+# Part 1: Identify all SSH processes (skip if clean only)
+if ! $clean_only; then
+    echo -e "${BOLD}${GREEN}===== ALL SSH PROCESSES =====${NC}"
+    echo -e "${CYAN}FORMAT: User (Age) → Command${NC}"
+    echo
+
+    # Get all SSH processes
+    ps_output=$(ps aux | grep ssh | grep -v grep)
+
+    # Apply user filter if needed
+    if [[ -n "$filter_user" ]]; then
+        filtered_output=""
+        while read line; do
+            pid=$(echo "$line" | awk '{print $2}')
+            if is_related_to_user "$pid" "$filter_user"; then
+                filtered_output="${filtered_output}${line}\n"
+            fi
+        done < <(echo "$ps_output")
+        ps_output=$(echo -e "$filtered_output" | grep -v "^$")
+    fi
+
+    if [[ -z "$ps_output" ]]; then
+        echo -e "${YELLOW}No SSH processes found for user: $filter_user${NC}"
+    else
+        echo "$ps_output" | sort -k 1,1 | while read line; do
+            user=$(echo "$line" | awk '{print $1}')
+            pid=$(echo "$line" | awk '{print $2}')
+            cmd=$(echo "$line" | awk '{print $11 " " $12 " " $13 " " $14 " " $15}')
+
+            # Get process age
+            age=$(get_process_age "$pid")
+
+            # Get connection info if available
+            conn_info=""
+            if [[ -n "${pid_to_conn[$pid]}" ]]; then
+                conn_info=" ${GREEN}[${pid_to_conn[$pid]}]${NC}"
+            fi
+
+            # Format based on command type
+            if [[ "$cmd" == *"[mux]"* ]]; then
+                socket_name=$(echo "$cmd" | grep -oP '.ssh/.sock/\K[^ ]*' || echo "")
+                if [[ -n "$socket_name" ]]; then
+                    socket_to_pid["$socket_name"]="$pid"
+                fi
+                echo -e "${YELLOW}User: ${BOLD}$user${NC} ${PURPLE}($age)${NC}, PID: $pid, Command: ${CYAN}$cmd${NC} ${YELLOW}[Control Master]${NC}$conn_info"
+            elif [[ "$cmd" == *"@"* && "$cmd" != *"-O"* ]] || is_outbound_ssh "$pid" "$cmd"; then
+                echo -e "${YELLOW}User: ${BOLD}$user${NC} ${PURPLE}($age)${NC}, PID: $pid, Command: ${CYAN}$cmd${NC}$conn_info"
+            else
+                echo -e "User: ${BOLD}$user${NC} ${PURPLE}($age)${NC}, PID: $pid, Command: $cmd$conn_info"
+            fi
+
+            # Show sudo chain for all SSH processes
+            sudo_chain=$(get_sudo_chain "$pid")
+            echo -e "  ${BLUE}↪ Connection chain: $sudo_chain${NC}"
+
+            # For outbound connections, show more details
+            if is_outbound_ssh "$pid" "$cmd"; then
+                echo -e "  ${GREEN}↪ OUTBOUND CONNECTION${NC}"
+
+                # Check if using a control socket
+                socket_used=$(ls -l /proc/$pid/fd 2>/dev/null | grep sock | grep -o ".ssh/.sock/[^ ]*" || echo "")
+                if [[ -n "$socket_used" ]]; then
+                    echo -e "  ${PURPLE}↪ Using socket: $socket_used${NC}"
+                fi
+
+                # Show full command line from /proc
+                if [[ -f "/proc/$pid/cmdline" ]]; then
+                    full_cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline")
+                    # Sanitize the command to avoid the terminal break issue
+                    full_cmd=$(sanitize_cmd "$full_cmd")
+                    echo -e "  ${GREEN}↪ Full command:${NC} $full_cmd"
+                fi
+
+                # Mark this PID as an outbound connection for use in the network section
+                outbound_pids["$pid"]=1
+            fi
+
+            # Show verbose information if enabled
+            if $verbose; then
+                show_verbose_process_info "$pid"
+            fi
+
+            echo ""
+        done
+    fi
+
+    # Show SSH system information in verbose mode
+    if $verbose; then
+        echo -e "${BOLD}${GREEN}===== SSH SYSTEM INFORMATION =====${NC}"
+        echo -e "${YELLOW}SSH version:${NC}"
+        ssh -V 2>&1 | sed 's/^/  /'
+
+        echo -e "${YELLOW}SSH config files:${NC}"
+        echo -e "  Global: $(find /etc/ssh -type f -name "ssh_config" 2>/dev/null)"
+        echo -e "  User: $(find /root/.ssh -type f -name "config" 2>/dev/null)"
+
+        if [[ -n "$filter_user" && "$filter_user" != "root" ]]; then
+            user_home=$(getent passwd "$filter_user" | cut -d: -f6)
+            if [[ -n "$user_home" ]]; then
+                echo -e "  $filter_user: $(find $user_home/.ssh -type f -name "config" 2>/dev/null 2>/dev/null)"
+            fi
+        fi
+
+        echo -e "${YELLOW}Known hosts:${NC}"
+        echo -e "  Global: $(find /etc/ssh -name "known_hosts" 2>/dev/null)"
+        echo -e "  User: $(find /root/.ssh -name "known_hosts" 2>/dev/null)"
+
+        echo -e "${YELLOW}SSH identity files:${NC}"
+        echo -e "  $(find /root/.ssh -name "id_*" 2>/dev/null | grep -v "\.pub$" | sed 's/^/  /')"
+
+        echo ""
+    fi
+fi
+
+# Part 2: Analyze control sockets and clean up stale ones
+if ! $clean_only; then
+    echo -e "${BOLD}${GREEN}===== CONTROL SOCKET ANALYSIS =====${NC}"
+    echo
+fi
+
+# Counter for stale sockets
+stale_count=0
+active_count=0
+
+for socket in $(find ~/.ssh/.sock -type s 2>/dev/null); do
+    socket_name=$(basename "$socket")
+    socket_age=$(stat -c %Y "$socket")
+    now=$(date +%s)
+    socket_age_seconds=$((now - socket_age))
+
+    # Format socket age
+    if [ $socket_age_seconds -lt 60 ]; then
+        socket_age_display="${socket_age_seconds}s"
+    elif [ $socket_age_seconds -lt 3600 ]; then
+        socket_age_display="$((socket_age_seconds / 60))m $((socket_age_seconds % 60))s"
+    elif [ $socket_age_seconds -lt 86400 ]; then
+        socket_age_display="$((socket_age_seconds / 3600))h $(((socket_age_seconds % 3600) / 60))m"
+    else
+        socket_age_display="$((socket_age_seconds / 86400))d $((socket_age_seconds % 86400 / 3600))h"
+    fi
+
+    # Get master process info
+    master_info=$(ssh -S "$socket" -O check dummy 2>&1)
+
+    # Extract PID from master info
+    master_pid=$(echo "$master_info" | grep -oP 'pid=\K[0-9]+')
+
+    # Check if the socket is stale
+    is_stale=false
+    if [[ -z "$master_pid" ]]; then
+        is_stale=true
+        stale_count=$((stale_count + 1))
+    elif ! ps -p $master_pid >/dev/null 2>&1; then
+        is_stale=true
+        stale_count=$((stale_count + 1))
+    else
+        active_count=$((active_count + 1))
+
+        # Skip this socket if filtering by user and not related
+        if [[ -n "$filter_user" ]] && ! is_related_to_user "$master_pid" "$filter_user"; then
+            # Check if any child process using this socket is related to the user
+            related=false
+            socket_users=$(ls -l /proc/*/fd 2>/dev/null | grep "$socket" | awk -F/ '{print $3}')
+            for proc_pid in $socket_users; do
+                if is_related_to_user "$proc_pid" "$filter_user"; then
+                    related=true
+                    break
+                fi
+            done
+
+            if ! $related; then
+                continue
+            fi
+        fi
+
+        if ! $clean_only; then
+            echo -e "${YELLOW}Socket: ${BOLD}$socket_name${NC} (Age: ${PURPLE}$socket_age_display${NC})"
+            echo -e "Status: $master_info"
+
+            master_user=$(ps -o user= -p $master_pid 2>/dev/null)
+            master_age=$(get_process_age $master_pid)
+
+            conn_info=""
+            if [[ -n "${pid_to_conn[$master_pid]}" ]]; then
+                conn_info=" ${GREEN}[${pid_to_conn[$master_pid]}]${NC}"
+            fi
+
+            echo -e "Master process owner: ${BOLD}$master_user${NC} (PID: $master_pid, Age: ${PURPLE}$master_age${NC})$conn_info"
+
+            # Show sudo chain for master process
+            sudo_chain=$(get_sudo_chain "$master_pid")
+            echo -e "${BLUE}Connection chain: $sudo_chain${NC}"
+
+            # Show full command line from /proc
+            if [[ -f "/proc/$master_pid/cmdline" ]]; then
+                full_cmd=$(tr '\0' ' ' < "/proc/$master_pid/cmdline")
+                # Sanitize the command to avoid the terminal break issue
+                full_cmd=$(sanitize_cmd "$full_cmd")
+                echo -e "${GREEN}Full command:${NC} $full_cmd"
+            fi
+
+            # Mark this as an outbound connection
+            outbound_pids["$master_pid"]=1
+
+            # Show verbose socket information
+            if $verbose; then
+                echo -e "${CYAN}=== SOCKET DETAILS ===${NC}"
+                echo -e "${YELLOW}Socket permissions:${NC}"
+                ls -la "$socket" | sed 's/^/  /'
+
+                echo -e "${YELLOW}Socket inode info:${NC}"
+                stat "$socket" | grep -E 'Inode|Access|Modify' | sed 's/^/  /'
+
+                echo -e "${YELLOW}Socket destination:${NC}"
+                dest=$(echo "$socket_name" | grep -oP '@\K.*' || echo "")
+                if [[ -n "$dest" ]]; then
+                    echo -e "  Host: $dest"
+                    ip=$(getent hosts "$dest" | awk '{print $1}' || echo "Unknown")
+                    echo -e "  IP: $ip"
+                    echo -e "  SSH banner: $(timeout 1 nc -w 1 "$dest" 22 2>/dev/null | head -n 1 || echo "Unavailable")"
+                else
+                    echo -e "  Unable to determine destination"
+                fi
+            fi
+
+            # Find processes using this socket
+            echo -e "Processes using this socket:"
+            socket_users=$(ls -l /proc/*/fd 2>/dev/null | grep "$socket" | grep -v "$master_pid" | awk -F/ '{print $3}' | sort | uniq)
+
+            if [[ -n "$socket_users" ]]; then
+                for proc_pid in $socket_users; do
+                    # Skip if filtering by user and not related
+                    if [[ -n "$filter_user" ]] && ! is_related_to_user "$proc_pid" "$filter_user"; then
+                        continue
+                    fi
+
+                    proc_user=$(ps -o user= -p $proc_pid 2>/dev/null)
+                    proc_cmd=$(ps -o cmd= -p $proc_pid 2>/dev/null)
+                    proc_age=$(get_process_age $proc_pid)
+
+                    if [[ -n "$proc_user" ]]; then
+                        conn_info=""
+                        if [[ -n "${pid_to_conn[$proc_pid]}" ]]; then
+                            conn_info=" ${GREEN}[${pid_to_conn[$proc_pid]}]${NC}"
+                        fi
+
+                        echo -e "  → User: ${BOLD}$proc_user${NC}, PID: $proc_pid, Age: ${PURPLE}$proc_age${NC}, Command: $proc_cmd$conn_info"
+
+                        # Show sudo chain for this process
+                        sudo_chain=$(get_sudo_chain "$proc_pid")
+                        echo -e "    ${BLUE}↪ Connection chain: $sudo_chain${NC}"
+
+                        # Show full command line from /proc
+                        if [[ -f "/proc/$proc_pid/cmdline" ]]; then
+                            full_cmd=$(tr '\0' ' ' < "/proc/$proc_pid/cmdline")
+                            # Sanitize the command to avoid the terminal break issue
+                            full_cmd=$(sanitize_cmd "$full_cmd")
+                            echo -e "    ${GREEN}↪ Full command:${NC} $full_cmd"
+                        fi
+
+                        # Show verbose process information
+                        if $verbose; then
+                            show_verbose_process_info "$proc_pid"
+                        fi
+
+                        # Mark this as an outbound connection too
+                        outbound_pids["$proc_pid"]=1
+                    fi
+                done
+            else
+                echo -e "  ${YELLOW}No client processes currently using this socket${NC}"
+            fi
+
+            echo -e "${CYAN}--------------------------------${NC}"
+        fi
+    fi
+
+    # Clean up stale socket if needed
+    if $is_stale; then
+        if ! $clean_only; then
+            echo -e "${RED}Cleaning up stale socket: $socket_name...${NC}"
+        fi
+        rm -f "$socket"
+        if ! $clean_only; then
+            echo -e "${GREEN}Socket removed.${NC}"
+            echo -e "${CYAN}--------------------------------${NC}"
+        fi
+    fi
+done
+
+# Summary of socket status
+if $clean_only; then
+    echo -e "Cleaned up $stale_count stale sockets. $active_count active sockets remain."
+else
+    echo -e "${YELLOW}Socket Summary: $active_count active, $stale_count stale (cleaned up)${NC}"
+    echo
+
+    # Part 3: Summary of SSH network connections with timestamps
+    echo -e "${BOLD}${GREEN}===== SSH NETWORK CONNECTIONS =====${NC}"
+    echo
+
+    # Display inbound connections
+    echo -e "${CYAN}Inbound SSH connections:${NC}"
+    inbound=$(ss -tnpo state established '( sport = :22 )' | grep -v State)
+
+    if [[ -n "$filter_user" ]]; then
+        filtered_inbound=""
+        while read line; do
+            pids=$(echo "$line" | grep -oP 'pid=\K[0-9]+')
+            for pid in $pids; do
+                if is_related_to_user "$pid" "$filter_user"; then
+                    filtered_inbound="${filtered_inbound}${line}\n"
+                    break
+                fi
+            done
+        done < <(echo "$inbound")
+        inbound=$(echo -e "$filtered_inbound" | grep -v "^$")
+    fi
+
+    if [[ -n "$inbound" ]]; then
+        echo "$inbound" | while read line; do
+            conn_info=$(echo "$line" | awk '{print $1, $2, $3, $4, $5}')
+            pid_info=$(echo "$line" | grep -oP 'users:\(\(.*?\)\)')
+
+            if [[ -n "$pid_info" ]]; then
+                pids=$(echo "$pid_info" | grep -oP 'pid=\K[0-9]+')
+                first_pid=$(echo "$pids" | head -n1)
+                age=$(get_process_age "$first_pid")
+
+                echo -e "$conn_info ${PURPLE}(Age: $age)${NC} $pid_info"
+
+                # Show connection chain for each PID
+                for pid in $pids; do
+                    sudo_chain=$(get_sudo_chain "$pid")
+                    echo -e "  ${BLUE}↪ Connection chain: $sudo_chain${NC}"
+
+                    # Show full command line from /proc
+                    if [[ -f "/proc/$pid/cmdline" ]]; then
+                        full_cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline")
+                        # Sanitize the command
+                        full_cmd=$(sanitize_cmd "$full_cmd")
+                        echo -e "  ${GREEN}↪ Full command:${NC} $full_cmd"
+                    fi
+
+                    # Show verbose connection information
+                    if $verbose; then
+                        echo -e "  ${CYAN}=== CONNECTION DETAILS ===${NC}"
+
+                        # Show login session info
+                        user=$(ps -o user= -p "$pid" 2>/dev/null)
+                        if [[ -n "$user" ]]; then
+                            login_info=$(who | grep "$user")
+                            if [[ -n "$login_info" ]]; then
+                                echo -e "  ${YELLOW}Login session:${NC}"
+                                echo "$login_info" | sed 's/^/    /'
+                            fi
+                        fi
+
+                        # Show authentication info if we can determine it
+                        echo -e "  ${YELLOW}Authentication method:${NC}"
+                        if grep -q "publickey" /var/log/auth.log | grep "$user"; then
+                            echo -e "    Authenticated with public key"
+                        elif grep -q "password" /var/log/auth.log | grep "$user"; then
+                            echo -e "    Authenticated with password"
+                        else
+                            echo -e "    Authentication method unknown"
+                        fi
+                    fi
+                done
+                echo ""
+            else
+                echo -e "$conn_info"
+                echo ""
+            fi
+        done
+    else
+        echo -e "${YELLOW}No inbound SSH connections found${NC}"
+        if [[ -n "$filter_user" ]]; then
+            echo -e "${YELLOW}(filtered for user: $filter_user)${NC}"
+        fi
+        echo ""
+    fi
+
+    # Display outbound connections
+    echo -e "${CYAN}Outbound SSH connections:${NC}"
+
+    # First, get directly observed outbound connections from ss
+    outbound=$(ss -tnpo state established '( dport = :22 )' | grep -v State)
+
+    # Check if there are any additional outbound SSH processes that might not have
+    # a connection visible to ss yet (e.g., in the process of connecting)
+    additional_outbound=""
+    for pid in "${!outbound_pids[@]}"; do
+        if ss -tnpo | grep "pid=$pid" | grep -q ":22"; then
+            # This PID is already in the ss output, skip it
+            continue
+        fi
+
+        # This is an outbound SSH process not captured in ss output
+        cmd=$(ps -o cmd= -p "$pid" 2>/dev/null)
+        user=$(ps -o user= -p "$pid" 2>/dev/null)
+
+        if [[ -n "$cmd" && "$cmd" == *"ssh"* && "$cmd" != *"sshd"* ]]; then
+            age=$(get_process_age "$pid")
+
+            # Extract destination if possible
+            destination=""
+            if [[ "$cmd" == *"@"* ]]; then
+                destination=$(echo "$cmd" | grep -oP '@\K[^ ]+' || echo "")
+            else
+                # Try to get last argument which is typically the host
+                destination=$(echo "$cmd" | awk '{print $NF}')
+            fi
+
+            # Get full command from /proc for later display
+            full_cmd=""
+            if [[ -f "/proc/$pid/cmdline" ]]; then
+                full_cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline")
+                # Sanitize the command
+                full_cmd=$(sanitize_cmd "$full_cmd")
+            fi
+
+            if [[ -n "$destination" ]]; then
+                additional_outbound="${additional_outbound}User: $user, PID: $pid, Age: $age, Command: $cmd, Destination: $destination, FullCmd: $full_cmd\n"
+            else
+                additional_outbound="${additional_outbound}User: $user, PID: $pid, Age: $age, Command: $cmd, FullCmd: $full_cmd\n"
+            fi
+        fi
+    done
+
+    # Filter outbound connections if needed
+    if [[ -n "$filter_user" ]]; then
+        filtered_outbound=""
+        while read line; do
+            pids=$(echo "$line" | grep -oP 'pid=\K[0-9]+')
+            for pid in $pids; do
+                if is_related_to_user "$pid" "$filter_user"; then
+                    filtered_outbound="${filtered_outbound}${line}\n"
+                    break
+                fi
+            done
+        done < <(echo "$outbound")
+        outbound=$(echo -e "$filtered_outbound" | grep -v "^$")
+
+        # Also filter additional outbound connections
+        if [[ -n "$additional_outbound" ]]; then
+            filtered_additional=""
+            while read line; do
+                pid=$(echo "$line" | grep -oP 'PID: \K[0-9]+')
+                if is_related_to_user "$pid" "$filter_user"; then
+                    filtered_additional="${filtered_additional}${line}\n"
+                fi
+            done < <(echo -e "$additional_outbound")
+            additional_outbound=$(echo -e "$filtered_additional" | grep -v "^$")
+        fi
+    fi
+
+    # Display the connections
+    have_outbound=false
+    if [[ -n "$outbound" ]]; then
+        have_outbound=true
+        echo "$outbound" | while read line; do
+            conn_info=$(echo "$line" | awk '{print $1, $2, $3, $4, $5}')
+            pid_info=$(echo "$line" | grep -oP 'users:\(\(.*?\)\)')
+
+            if [[ -n "$pid_info" ]]; then
+                pids=$(echo "$pid_info" | grep -oP 'pid=\K[0-9]+')
+                first_pid=$(echo "$pids" | head -n1)
+                age=$(get_process_age "$first_pid")
+
+                echo -e "$conn_info ${PURPLE}(Age: $age)${NC} $pid_info"
+
+                # Show connection chain for each PID
+                for pid in $pids; do
+                    sudo_chain=$(get_sudo_chain "$pid")
+                    echo -e "  ${BLUE}↪ Connection chain: $sudo_chain${NC}"
+
+                    # Show full command line from /proc
+                    if [[ -f "/proc/$pid/cmdline" ]]; then
+                        full_cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline")
+                        # Sanitize the command
+                        full_cmd=$(sanitize_cmd "$full_cmd")
+                        echo -e "  ${GREEN}↪ Full command:${NC} $full_cmd"
+                    fi
+
+                    # Show verbose information if enabled
+                    if $verbose; then
+                        echo -e "  ${CYAN}=== CONNECTION DETAILS ===${NC}"
+
+                        # Determine authentication method
+                        echo -e "  ${YELLOW}Authentication method:${NC}"
+                        if [[ -f "/proc/$pid/environ" ]] && grep -q "SSH_AUTH_SOCK" "/proc/$pid/environ"; then
+                            echo -e "    Using SSH agent"
+                            ssh_auth_sock=$(tr '\0' '\n' < "/proc/$pid/environ" | grep "^SSH_AUTH_SOCK=" | cut -d= -f2)
+                            if [[ -n "$ssh_auth_sock" ]]; then
+                                echo -e "    Agent socket: $ssh_auth_sock"
+                            fi
+                        elif [[ -f "/proc/$pid/cmdline" ]] && tr '\0' ' ' < "/proc/$pid/cmdline" | grep -q -- "-i "; then
+                            key_file=$(tr '\0' ' ' < "/proc/$pid/cmdline" | grep -o -- "-i [^ ]*" | cut -d' ' -f2)
+                            echo -e "    Using identity file: $key_file"
+                        else
+                            echo -e "    Likely using password or default keys"
+                        fi
+
+                        # Check for port forwarding
+                        if [[ -f "/proc/$pid/cmdline" ]]; then
+                            cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline")
+                            # Sanitize the command
+                            cmd=$(sanitize_cmd "$cmd")
+                            if [[ "$cmd" == *"-L "* || "$cmd" == *"-R "* || "$cmd" == *"-D "* ]]; then
+                                echo -e "  ${YELLOW}Port forwarding:${NC}"
+                                if [[ "$cmd" == *"-L "* ]]; then
+                                    local_fwd=$(echo "$cmd" | grep -o -- "-L [^ ]*")
+                                    echo -e "    Local forwarding: $local_fwd"
+                                fi
+                                if [[ "$cmd" == *"-R "* ]]; then
+                                    remote_fwd=$(echo "$cmd" | grep -o -- "-R [^ ]*")
+                                    echo -e "    Remote forwarding: $remote_fwd"
+                                fi
+                                if [[ "$cmd" == *"-D "* ]]; then
+                                    dynamic_fwd=$(echo "$cmd" | grep -o -- "-D [^ ]*")
+                                    echo -e "    Dynamic forwarding: $dynamic_fwd"
+                                fi
+                            fi
+                        fi
+
+                        # Show control socket if applicable
+                        if [[ -d "/proc/$pid/fd" ]]; then
+                            socket_file=$(ls -l /proc/$pid/fd 2>/dev/null | grep ".ssh/.sock/" | head -1)
+                            if [[ -n "$socket_file" ]]; then
+                                socket_path=$(echo "$socket_file" | grep -o "/root/.ssh/.sock/[^ ]*")
+                                echo -e "  ${YELLOW}Using control socket:${NC} $socket_path"
+                            fi
+                        fi
+                    fi
+                done
+                echo ""
+            else
+                echo -e "$conn_info"
+                echo ""
+            fi
+        done
+    fi
+
+    # Display additional outbound connections that might not be in ss output
+    if [[ -n "$additional_outbound" ]]; then
+        have_outbound=true
+        echo -e "${YELLOW}Additional outbound SSH processes:${NC}"
+        echo -e "$additional_outbound" | grep -v "^User:  (), PID: , Command:" | while read line; do
+            # Skip empty or incomplete lines
+            if [[ -z "$line" || "$line" == *"User:  (), PID: , Command: "* ]]; then
+                continue
+            fi
+            
+            # Extract data from the line
+            user=$(echo "$line" | grep -oP 'User: \K[^,]+')
+            pid=$(echo "$line" | grep -oP 'PID: \K[0-9]+')
+            age=$(echo "$line" | grep -oP 'Age: \K[^,]+')
+            cmd=$(echo "$line" | grep -oP 'Command: \K[^,]+')
+            dest=$(echo "$line" | grep -oP 'Destination: \K[^,]+' || echo "")
+            full_cmd=$(echo "$line" | grep -oP 'FullCmd: \K.*' || echo "")
+
+            # Skip if we don't have required data
+            if [[ -z "$user" || -z "$pid" || -z "$cmd" ]]; then
+                continue
+            fi
+
+            # Display with consistent formatting
+            if [[ -n "$dest" ]]; then
+                echo -e "${YELLOW}User: ${BOLD}$user${NC} ${PURPLE}($age)${NC}, PID: $pid, Command: ${CYAN}$cmd${NC} → $dest"
+            else
+                echo -e "${YELLOW}User: ${BOLD}$user${NC} ${PURPLE}($age)${NC}, PID: $pid, Command: ${CYAN}$cmd${NC}"
+            fi
+
+            # Show connection chain
+            if [[ -n "$pid" ]]; then
+                sudo_chain=$(get_sudo_chain "$pid")
+                echo -e "  ${BLUE}↪ Connection chain: $sudo_chain${NC}"
+
+                # Show full command line
+                if [[ -n "$full_cmd" ]]; then
+                    echo -e "  ${GREEN}↪ Full command:${NC} $full_cmd"
+                elif [[ -f "/proc/$pid/cmdline" ]]; then
+                    full_cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline")
+                    # Sanitize the command
+                    full_cmd=$(sanitize_cmd "$full_cmd")
+                    echo -e "  ${GREEN}↪ Full command:${NC} $full_cmd"
+                fi
+
+                # Show verbose information if enabled
+                if $verbose; then
+                    echo -e "  ${CYAN}=== PROCESS DETAILS ===${NC}"
+                    show_verbose_process_info "$pid"
+                fi
+            fi
+            echo ""
+        done
+    fi
+
+    if ! $have_outbound; then
+        echo -e "${YELLOW}No outbound SSH connections found${NC}"
+        if [[ -n "$filter_user" ]]; then
+            echo -e "${YELLOW}(filtered for user: $filter_user)${NC}"
+        fi
+        echo ""
+    fi
+
+    # In verbose mode, show SSH log activity
+    if $verbose; then
+        echo -e "${BOLD}${GREEN}===== SSH LOG ACTIVITY =====${NC}"
+        echo
+
+        echo -e "${CYAN}Recent SSH login attempts:${NC}"
+        if [[ -n "$filter_user" ]]; then
+            grep -i ssh /var/log/auth.log | grep -i "$filter_user" | tail -10 || echo "No recent activity found for $filter_user"
+        else
+            grep -i ssh /var/log/auth.log | tail -10 || echo "No recent SSH activity found in logs"
+        fi
+        echo ""
+
+        echo -e "${CYAN}Failed login attempts (last 10):${NC}"
+        grep "Failed password" /var/log/auth.log | tail -10 || echo "No failed login attempts found"
+        echo ""
+
+        echo -e "${CYAN}Current login sessions:${NC}"
+        who || echo "No active sessions found"
+        echo ""
+    fi
+fi
