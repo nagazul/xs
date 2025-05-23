@@ -482,101 +482,6 @@ EXPECT_EOF
             ;;
     esac
 }
-add_key_to_agent_expect() {
-    local key_path="$1"
-    local passphrase="$2"
-
-    log_debug "Adding key: $key_path"
-    log_debug "Passphrase length: ${#passphrase}"
-
-    if [ -f "$AGENT_ENV" ]; then
-        . "$AGENT_ENV" >/dev/null 2>&1
-    fi
-
-    if ! command -v expect >/dev/null 2>&1; then
-        printf "${RC}Error: 'expect' is required but not installed${NC}\n"
-        return 1
-    fi
-
-    local tmpfile=$(mktemp)
-    TEMP_FILES+=("$tmpfile")
-    log_debug "Created temporary expect script: $tmpfile"
-
-    cat > "$tmpfile" << 'EOF'
-#!/usr/bin/expect -f
-set timeout 10
-set key_path [lindex $argv 0]
-set passphrase [lindex $argv 1]
-
-spawn ssh-add $key_path
-expect {
-    "Enter passphrase for $key_path:" {
-        send "$passphrase\r"
-        expect "Identity added" {
-            exit 0
-        }
-    }
-    "Identity added" {
-        exit 0
-    }
-    timeout {
-        puts "Timeout waiting for ssh-add"
-        exit 1
-    }
-    eof {
-        catch wait result
-        exit [lindex $result 3]
-    }
-}
-EOF
-    chmod 700 "$tmpfile"
-
-    expect "$tmpfile" "$key_path" "$passphrase" 2>/dev/null
-    local status=$?
-
-    safe_delete "$tmpfile"
-
-    if [ $status -eq 0 ]; then
-        printf "${GC}SSH key '%s' added to the agent.${NC}\n" "$key_path"
-        return 0
-    else
-        printf "${RC}Error: Failed to add key %s (status: %d)${NC}\n" "$key_path" "$status"
-        return 1
-    fi
-}
-add_key_to_agent_disk() {
-    local key_path="$1"
-    local passphrase="$2"
-
-    log_debug "Adding key: $key_path"
-    log_debug "Passphrase length: ${#passphrase}"
-
-    if [ -f "$AGENT_ENV" ]; then
-        . "$AGENT_ENV" >/dev/null 2>&1
-    fi
-
-    local tmpfile=$(mktemp)
-    chmod 700 "$tmpfile"
-    TEMP_FILES+=("$tmpfile")
-
-    cat > "$tmpfile" << EOF
-#!/bin/bash
-echo "$passphrase"
-EOF
-
-    DISPLAY="none" SSH_ASKPASS="$tmpfile" ssh-add "$key_path" </dev/null 2>/dev/null
-    local status=$?
-
-    safe_delete "$tmpfile"
-
-    if [ $status -eq 0 ]; then
-        printf "${GC}SSH key '%s' added to the agent.${NC}\n" "$key_path"
-        return 0
-    else
-        printf "${RC}Error: Failed to add key %s (status: %d)${NC}\n" "$key_path" "$status"
-        return 1
-    fi
-}
 
 # Cleans up temporary files and directories while preserving key configuration
 clean_xkeys() {
@@ -731,7 +636,7 @@ setup_passphrase() {
     return 0
 }
 
-# Function to decrypt and retrieve passphrase for a key
+# Enhanced retrieve_passphrase with better error handling
 retrieve_passphrase() {
     local key_path="$1"
     local passphrase_file="$KEYS_ENC/$(key_checksum "$key_path").enc"
@@ -739,6 +644,12 @@ retrieve_passphrase() {
     if [ ! -f "$passphrase_file" ]; then
         log_debug "Passphrase file not found: $passphrase_file"
         return 1
+    fi
+
+    # Check if file has correct permissions
+    if [ "$(stat -L -c "%a" "$passphrase_file")" != "400" ]; then
+        printf "${RC}Warning: Incorrect permissions on passphrase file: %s${NC}\n" "$passphrase_file" >&2
+        chmod 400 "$passphrase_file"
     fi
 
     if [ -z "$MASTER_PASSWORD_CACHE" ]; then
@@ -752,10 +663,17 @@ retrieve_passphrase() {
     kek=$(derive_kek "$MASTER_PASSWORD_CACHE")
 
     # Direct decryption without temp files
+    local decrypted_passphrase
     decrypted_passphrase=$(openssl enc -d -aes-256-cbc -pbkdf2 -iter 10000 -md sha256 -k "$kek" -in "$passphrase_file" 2>/dev/null)
-    [ $? -eq 0 ] || return 1
+    local decrypt_status=$?
 
-    echo -n "$decrypted_passphrase"
+    if [ $decrypt_status -eq 0 ] && [ -n "$decrypted_passphrase" ]; then
+        echo -n "$decrypted_passphrase"
+        return 0
+    else
+        log_debug "Failed to decrypt passphrase file: $passphrase_file (status: $decrypt_status)"
+        return 1
+    fi
 }
 
 # Function to scan for SSH keys in a directory
@@ -873,41 +791,146 @@ verify_keys() {
 load_all_keys() {
     if ! check_ssh_agent; then
         init_ssh_agent || return 1
+        log_debug "LOAD_ALL_KEYS: New agent (PID $SSH_AGENT_PID, SOCK $SSH_AUTH_SOCK) initialized."
+        # It's good practice to ensure a newly initialized agent is empty,
+        # though ssh-agent should start empty. This is a safeguard.
+        ssh-add -D >/dev/null 2>&1
+        log_debug "LOAD_ALL_KEYS: Ran ssh-add -D on new agent."
+    else
+        log_debug "LOAD_ALL_KEYS: Reusing existing agent (PID $SSH_AGENT_PID, SOCK $SSH_AUTH_SOCK)."
     fi
 
     local success=0
     local total=0
+    local has_encrypted=0
 
+    # First, check if we have any registered keys that are passphrase protected
+    log_debug "LOAD_ALL_KEYS: Checking for encrypted keys to determine if Master Password is needed."
+    for key_link_scan in "$KEYS_DIR"/*; do
+        [ -L "$key_link_scan" ] || continue
+        local key_path_scan=$(readlink -f "$key_link_scan")
+        if ! ssh-keygen -y -f "$key_path_scan" -P "" >/dev/null 2>&1; then
+            has_encrypted=1
+            log_debug "LOAD_ALL_KEYS: Found encrypted key $key_path_scan. Master Password will be required."
+            break # Found one, no need to check further
+        fi
+    done
+
+    # If we have encrypted keys and no master password cached, prompt once
+    if [ "$has_encrypted" -eq 1 ] && [ -z "$MASTER_PASSWORD_CACHE" ]; then
+        log_debug "LOAD_ALL_KEYS: Prompting for Master Password."
+        printf "Enter Master Password to decrypt keys: "
+        read -s master_password
+        echo
+
+        # Validate the master password by trying to decrypt the first available encrypted key's passphrase file
+        local validation_done=0
+        for key_link_val in "$KEYS_DIR"/*; do
+            [ -L "$key_link_val" ] || continue
+            local key_path_val=$(readlink -f "$key_link_val")
+            local passphrase_file_val="$KEYS_ENC/$(key_checksum "$key_path_val").enc"
+
+            # Only try to validate with an actual encrypted key that has a .enc file
+            if [ -f "$passphrase_file_val" ] && ! ssh-keygen -y -f "$key_path_val" -P "" >/dev/null 2>&1; then
+                log_debug "LOAD_ALL_KEYS: Validating Master Password with $key_path_val."
+                local kek_val=$(derive_kek "$master_password")
+                if openssl enc -d -aes-256-cbc -pbkdf2 -iter 10000 -md sha256 -k "$kek_val" -in "$passphrase_file_val" >/dev/null 2>&1; then
+                    MASTER_PASSWORD_CACHE="$master_password"
+                    validation_done=1
+                    log_debug "LOAD_ALL_KEYS: Master Password validation successful with $key_path_val."
+                    break
+                else
+                    log_debug "LOAD_ALL_KEYS: Master Password validation failed with $key_path_val (openssl decryption failed)."
+                fi
+            fi
+        done
+
+        if [ "$validation_done" -eq 0 ]; then
+            printf "${RC}Error: Invalid master password, or no decryptable passphrase files found to verify.${NC}\n"
+            MASTER_PASSWORD_CACHE="" # Ensure cache is clear if validation failed
+            return 1
+        fi
+        log_debug "LOAD_ALL_KEYS: Master password validated and cached."
+    fi # End of Master Password handling
+
+    log_debug "LOAD_ALL_KEYS: Entering main key-loading loop."
+    # Now load all keys
     for key_link in "$KEYS_DIR"/*; do
         [ -L "$key_link" ] || continue
         ((total++))
         local key_path=$(readlink -f "$key_link")
+        log_debug "LOAD_ALL_KEYS (main loop): Processing key $key_path."
 
-        # Check if key is already loaded in agent
-        if ssh-add -l 2>/dev/null | grep -q "$(ssh-keygen -l -f "$key_path" 2>/dev/null | cut -d' ' -f2)"; then
+        # To check if key is already loaded, we need its public key fingerprint.
+        # For encrypted private keys, getting fingerprint directly from private key needs passphrase.
+        # So, get it from the corresponding .pub file if it exists.
+        local pub_key_path="${key_path}.pub"
+        local key_fingerprint=""
+        if [ -f "$pub_key_path" ]; then
+            key_fingerprint=$(ssh-keygen -l -f "$pub_key_path" 2>/dev/null | awk '{print $2}')
+            log_debug "LOAD_ALL_KEYS (main loop): Got fingerprint '$key_fingerprint' from public key $pub_key_path."
+        else
+            # Fallback: try from private key - this will likely be empty for encrypted keys
+            # but might work for unencrypted keys if .pub is missing.
+            key_fingerprint=$(ssh-keygen -l -f "$key_path" 2>/dev/null | awk '{print $2}')
+            log_debug "LOAD_ALL_KEYS (main loop): Public key for $key_path not found. Got fingerprint '$key_fingerprint' from private key (might be empty if encrypted)."
+        fi
+
+        local key_found_in_agent=0
+        if [ -n "$key_fingerprint" ]; then
+            if ssh-add -l 2>/dev/null | grep -q -F "$key_fingerprint"; then # Use -F for fixed string matching
+                key_found_in_agent=1
+            fi
+        else
+            log_debug "LOAD_ALL_KEYS (main loop): Could not obtain a fingerprint for $key_path to check if already loaded. Will attempt to load."
+        fi
+
+        if [ "$key_found_in_agent" -eq 1 ]; then
             ((success++))
             printf "${GC}Key already loaded: %s${NC}\n" "$key_path"
+            log_debug "LOAD_ALL_KEYS (main loop): Key $key_path (fingerprint $key_fingerprint) reported as 'already loaded'."
             continue
         fi
 
+        log_debug "LOAD_ALL_KEYS (main loop): Key $key_path NOT 'already loaded' or fingerprint unavailable. Proceeding to add."
         if ssh-keygen -y -f "$key_path" -P "" >/dev/null 2>&1; then
             # Non-encrypted key
+            log_debug "LOAD_ALL_KEYS (main loop): Key $key_path is non-encrypted. Adding with ssh-add."
             if ssh-add "$key_path" >/dev/null 2>&1; then
                 success=$((success + 1))
                 printf "${GC}Added non-encrypted key: %s${NC}\n" "$key_path"
+            else
+                printf "${RC}Failed to add non-encrypted key: %s${NC}\n" "$key_path"
             fi
         else
             # Encrypted key
+            log_debug "LOAD_ALL_KEYS (main loop): Key $key_path is encrypted. Retrieving passphrase."
             local passphrase
-            if passphrase=$(retrieve_passphrase "$key_path"); then
+            if passphrase=$(retrieve_passphrase "$key_path"); then # retrieve_passphrase uses MASTER_PASSWORD_CACHE
+                log_debug "LOAD_ALL_KEYS (main loop): Passphrase retrieved for $key_path. Adding to agent."
                 if add_key_to_agent "$key_path" "$passphrase"; then
                     success=$((success + 1))
+                    # Message "SSH key '%s' added successfully" is printed by add_key_to_agent
+                else
+                    printf "${RC}Failed to add encrypted key (via add_key_to_agent): %s${NC}\n" "$key_path"
                 fi
+            else
+                printf "${RC}Failed to decrypt passphrase for: %s${NC}\n" "$key_path"
             fi
         fi
+        log_debug "LOAD_ALL_KEYS (main loop): Finished processing $key_path."
     done
 
-    printf "Successfully loaded %d of %d keys.\n" "$success" "$total"
+    printf "\nSuccessfully loaded %d of %d keys.\n" "$success" "$total"
+
+    # Clear master password cache after loading all keys
+    # Note: The trap 'cleanup_master_password EXIT' also handles this.
+    # Explicitly clearing here is for added safety if the script is long-running or used in complex ways.
+    if [ "$has_encrypted" -eq 1 ]; then # Only clear if it might have been set
+        MASTER_PASSWORD_CACHE=""
+        log_debug "LOAD_ALL_KEYS: Master password cache cleared."
+    fi
+
     [ "$success" -eq "$total" ]
 }
 
@@ -989,6 +1012,95 @@ change_master_password() {
     fi
 }
 
+# Add a new function to test key loading without actually loading
+xkeys_test() {
+    printf "Testing xkeys configuration...\n\n"
+
+    # Check directories
+    printf "Checking directories:\n"
+    printf "  SSH_DIR: %s " "$SSH_DIR"
+    [ -d "$SSH_DIR" ] && printf "${GC}[OK]${NC}\n" || printf "${RC}[MISSING]${NC}\n"
+
+    printf "  KEYS_DIR: %s " "$KEYS_DIR"
+    [ -d "$KEYS_DIR" ] && printf "${GC}[OK]${NC}\n" || printf "${RC}[MISSING]${NC}\n"
+
+    printf "  KEYS_ENC: %s " "$KEYS_ENC"
+    [ -d "$KEYS_ENC" ] && printf "${GC}[OK]${NC}\n" || printf "${RC}[MISSING]${NC}\n"
+
+    printf "\nChecking registered keys:\n"
+    local key_count=0
+    for key_link in "$KEYS_DIR"/*; do
+        [ -L "$key_link" ] || continue
+        ((key_count++))
+        local key_path=$(readlink -f "$key_link")
+        local passphrase_file="$KEYS_ENC/$(key_checksum "$key_path").enc"
+
+        printf "  Key: %s\n" "$key_path"
+        printf "    Link: %s " "$key_link"
+        [ -L "$key_link" ] && printf "${GC}[OK]${NC}\n" || printf "${RC}[BROKEN]${NC}\n"
+
+        printf "    Target: "
+        [ -f "$key_path" ] && printf "${GC}[EXISTS]${NC}\n" || printf "${RC}[MISSING]${NC}\n"
+
+        printf "    Encrypted: "
+        if ssh-keygen -y -f "$key_path" -P "" >/dev/null 2>&1; then
+            printf "${RC}[NO]${NC}\n"
+        else
+            printf "${GC}[YES]${NC}\n"
+            printf "    Passphrase file: "
+            if [ -f "$passphrase_file" ]; then
+                printf "${GC}[EXISTS]${NC}"
+                local perms=$(stat -L -c "%a" "$passphrase_file")
+                [ "$perms" = "400" ] && printf " ${GC}[PERMS OK]${NC}\n" || printf " ${RC}[PERMS: %s]${NC}\n" "$perms"
+            else
+                printf "${RC}[MISSING]${NC}\n"
+            fi
+        fi
+    done
+
+    [ "$key_count" -eq 0 ] && printf "  ${RC}No keys registered${NC}\n"
+
+    printf "\nTesting master password (if you have encrypted keys):\n"
+    local has_encrypted=0
+    for key_link in "$KEYS_DIR"/*; do
+        [ -L "$key_link" ] || continue
+        local key_path=$(readlink -f "$key_link")
+        if ! ssh-keygen -y -f "$key_path" -P "" >/dev/null 2>&1; then
+            has_encrypted=1
+            break
+        fi
+    done
+
+    if [ "$has_encrypted" -eq 1 ]; then
+        printf "Enter Master Password to test decryption: "
+        read -s test_password
+        echo
+
+        local test_success=0
+        local test_total=0
+        for key_link in "$KEYS_DIR"/*; do
+            [ -L "$key_link" ] || continue
+            local key_path=$(readlink -f "$key_link")
+            local passphrase_file="$KEYS_ENC/$(key_checksum "$key_path").enc"
+
+            [ -f "$passphrase_file" ] || continue
+            ((test_total++))
+
+            local kek=$(derive_kek "$test_password")
+            if openssl enc -d -aes-256-cbc -pbkdf2 -iter 10000 -md sha256 -k "$kek" -in "$passphrase_file" >/dev/null 2>&1; then
+                ((test_success++))
+                printf "  ${GC}✓ Successfully decrypted passphrase for: %s${NC}\n" "$(basename "$key_path")"
+            else
+                printf "  ${RC}✗ Failed to decrypt passphrase for: %s${NC}\n" "$(basename "$key_path")"
+            fi
+        done
+
+        printf "\nDecryption test: %d/%d successful\n" "$test_success" "$test_total"
+    else
+        printf "  No encrypted keys found to test\n"
+    fi
+}
+
 # Add key to xkeys management
 _xkeys_add() {
     local key_path="$1"
@@ -1006,13 +1118,13 @@ _xkeys_add() {
     # Check if key is already registered
     if [[ -L "$target_link" && "$(readlink -f "$target_link")" == "$sanitized_path" ]]; then
         printf "${GY}Key '%s' is already registered.${NC}\n" "$sanitized_path"
-        
+
         # If passphrase exists, try to load the key
         if [[ -f "$passphrase_file" ]]; then
             if ! check_ssh_agent; then
                 init_ssh_agent || return 1
             fi
-            
+
             # Try to retrieve the passphrase
             local passphrase
             if ! passphrase=$(retrieve_passphrase "$sanitized_path"); then
@@ -1192,6 +1304,9 @@ xkeys() {
         passwd)
             change_master_password
             ;;
+        test)
+            xkeys_test
+            ;;
         *)
             cat << EOF
 Enhanced SSH Agent Management with Multi-Key Support
@@ -1207,6 +1322,7 @@ Commands:
  purge --force    - Remove all xkeys data (requires --force)
  verify           - Verify keys integrity
  passwd           - Change master password
+ test             - Test xkeys configuration and key accessibility
 EOF
             return 1
             ;;
@@ -1219,7 +1335,7 @@ _xkeys_complete() {
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    commands="ls scan add rm load verify passwd kill clean purge"
+    commands="ls scan add rm load verify passwd kill clean purge test"
 
     case "${prev}" in
         "xkeys")
