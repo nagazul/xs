@@ -279,7 +279,7 @@ init_ssh_agent() {
 }
 
 # Terminates all xkeys-managed SSH agents
-kill_xkeys_agents() {
+_xkeys_kill_agents() {
     printf "Searching for running SSH agents...\\n"
 
     # Iterate over all SSH agents belonging to the current user
@@ -487,7 +487,7 @@ EXPECT_EOF
 }
 
 # Cleans up temporary files and directories while preserving key configuration
-clean_xkeys() {
+_xkeys_clean() {
     local force="$1"
     local cleaned=0
     local total=0
@@ -543,15 +543,15 @@ clean_xkeys() {
 }
 
 # Completely purges all xkeys data and configuration
-purge_xkeys() {
+_xkeys_purge() {
     [ "$1" != "--force" ] && {
         printf "${RC}Error: This operation requires --force flag${NC}\n"
         return 1
     }
 
     printf "${GY}Starting complete xkeys purge...${NC}\n"
-    kill_xkeys_agents
-    clean_xkeys "--force"
+    _xkeys_kill_agents
+    _xkeys_clean "--force"
 
     # Purge runtime directory
     [ -d "$TMP_DIR" ] && {
@@ -680,7 +680,7 @@ retrieve_passphrase() {
 }
 
 # Function to scan for SSH keys in a directory
-scan_ssh_keys() {
+_xkeys_scan_ssh_keys() {
     local scan_dir="${1:-$SSH_DIR}"
     local key_pattern='id_*'
     local max_path_len=50  # Default minimum width for key paths
@@ -739,7 +739,7 @@ scan_ssh_keys() {
 }
 
 # Function to verify all encrypted keys and passphrases
-verify_keys() {
+_xkeys_verify_keys() {
     printf "Enter Master Password to verify keys: "
     read -s master_password
     echo
@@ -791,7 +791,7 @@ verify_keys() {
 }
 
 # Load all keys from the managed directory into the agent
-load_all_keys() {
+_xkeys_load_all_keys() {
     if ! check_ssh_agent; then
         init_ssh_agent || return 1
         log_debug "LOAD_ALL_KEYS: New agent (PID $SSH_AGENT_PID, SOCK $SSH_AUTH_SOCK) initialized."
@@ -961,7 +961,7 @@ rm_key() {
     return 0
 }
 
-change_master_password() {
+_xkeys_change_master_password() {
     printf "Enter current Master Password: "
     read -s current_password
     echo
@@ -1016,7 +1016,7 @@ change_master_password() {
 }
 
 # Add a new function to test key loading without actually loading
-xkeys_test() {
+_xkeys_test() {
     printf "Testing xkeys configuration...\n\n"
 
     # Check directories
@@ -1297,7 +1297,7 @@ xkeys() {
             _xkeys_remove "$2"
             ;;
         load)
-            load_all_keys
+            _xkeys_load_all_keys
             ;;
         ls|-l)
             if check_ssh_agent; then
@@ -1309,25 +1309,25 @@ xkeys() {
             fi
             ;;
         verify)
-            verify_keys
+            _xkeys_verify_keys
             ;;
         scan)
-            scan_ssh_keys "${2:-$SSH_DIR}"
+            _xkeys_scan_ssh_keys "${2:-$SSH_DIR}"
             ;;
         kill)
-            kill_xkeys_agents
+            _xkeys_kill_agents
             ;;
         clean)
-            clean_xkeys "$2"
+            _xkeys_clean "$2"
             ;;
         purge)
-            purge_xkeys "$2"
+            _xkeys_purge "$2"
             ;;
         passwd)
-            change_master_password
+            _xkeys_change_master_password
             ;;
         test)
-            xkeys_test
+            _xkeys_test
             ;;
         *)
             cat << EOF
