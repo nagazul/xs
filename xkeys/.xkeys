@@ -14,6 +14,7 @@ readonly XKEYS_LOADED=1
 
 # Debug mode - set to 1 to enable debug logging
 DEBUG_MODE=${DEBUG_MODE:-0}
+export DEBUG_MODE
 
 # Define color codes (enable interpretation of backslash escapes)
 GC=$'\e[32m'    # Green Color
@@ -57,6 +58,7 @@ declare -a TEMP_FILES
 log_debug() {
     [ "$DEBUG_MODE" -eq 1 ] && printf "${GY}[DEBUG] $1${NC}\n"
 }
+export -f log_debug
 
 # Cleanup functions
 cleanup_temp_files() {
@@ -72,8 +74,8 @@ cleanup_master_password() {
 }
 
 # Register cleanup handlers
-trap cleanup_temp_files EXIT
-trap cleanup_master_password EXIT
+trap cleanup_temp_files EXIT INT TERM
+trap cleanup_master_password EXIT INT TERM
 
 # Create and secure directories
 mkdir -p "$TMP_DIR" "$KEYS_DIR" "$KEYS_ENC"
@@ -225,7 +227,7 @@ check_ssh_agent() {
     if [ -f "$AGENT_ENV" ]; then
         . "$AGENT_ENV" >/dev/null 2>&1
 
-        if [ -n "$SSH_AGENT_PID" ] && ps -p "$SSH_AGENT_PID" >/dev/null 2>&1; then
+        if [ -n "$SSH_AGENT_PID" ] && [[ "$SSH_AGENT_PID" =~ ^[0-9]+$ ]] && ps -p "$SSH_AGENT_PID" >/dev/null 2>&1; then
             if [ -n "$SSH_AUTH_SOCK" ] && [ -S "$SSH_AUTH_SOCK" ]; then
                 if ssh-add -l >/dev/null 2>&1 || [ $? -eq 1 ]; then
                     return 0
@@ -262,6 +264,7 @@ init_ssh_agent() {
 
     ssh-agent -a "$SSH_AUTH_SOCK" > "$temp_env" || {
         safe_delete "$temp_env" "$TMP_PATTERN" "600"
+        safe_delete "$SSH_AUTH_SOCK" "$TMP_PATTERN" "600"
         safe_delete_dir "$agent_dir" "$TMP_PATTERN"
         printf "${RC}Failed to start SSH agent${NC}\n"
         return 1
@@ -784,7 +787,7 @@ verify_keys() {
     done
 
     printf "\nVerified %d of %d keys.\n" "$success" "$total"
-    return $([ "$success" -eq "$total" ])
+    [ "$success" -eq "$total" ]
 }
 
 # Load all keys from the managed directory into the agent
@@ -1115,7 +1118,20 @@ _xkeys_add() {
     local target_link="$KEYS_DIR/$key_name"
     local passphrase_file="$KEYS_ENC/$(key_checksum "$sanitized_path").enc"
 
-    # Check if key is already registered
+    # Check for basename collision with a *different* key
+    if [ -L "$target_link" ]; then
+        local current_target_path
+        current_target_path=$(readlink -f "$target_link")
+        if [ "$current_target_path" != "$sanitized_path" ]; then
+            printf "${RC}Error: Key with basename '%s' already exists but points to a different file:${NC}\n" "$key_name"
+            printf "  Existing: %s\n" "$current_target_path"
+            printf "  Attempted: %s\n" "$sanitized_path"
+            printf "${RC}Please use a key with a unique basename or manage one manually.${NC}\n"
+            return 1
+        fi
+    fi
+
+    # Check if key is already registered (and points to the same file)
     if [[ -L "$target_link" && "$(readlink -f "$target_link")" == "$sanitized_path" ]]; then
         printf "${GY}Key '%s' is already registered.${NC}\n" "$sanitized_path"
 
@@ -1125,7 +1141,6 @@ _xkeys_add() {
                 init_ssh_agent || return 1
             fi
 
-            # Try to retrieve the passphrase
             local passphrase
             if ! passphrase=$(retrieve_passphrase "$sanitized_path"); then
                 # If retrieval failed, re-encrypt with new master password
@@ -1146,7 +1161,6 @@ _xkeys_add() {
                 local kek
                 kek=$(derive_kek "$MASTER_PASSWORD_CACHE")
 
-                # Remove existing passphrase file and create new one
                 safe_delete_passphrase "$passphrase_file"
                 echo -n "$ssh_passphrase" | openssl enc -aes-256-cbc -salt -pbkdf2 -iter 10000 -md sha256 -k "$kek" -out "$passphrase_file" || {
                     printf "${RC}Error: Failed to save passphrase${NC}\n"
@@ -1164,15 +1178,19 @@ _xkeys_add() {
             printf "${RC}Failed to load existing key.${NC}\n"
             return 1
         fi
+        # If key is registered but passphrase file is missing, fall through to set it up
     fi
 
-    # Continue with normal key addition for new keys...
+    # Create or update symlink
     ln -sfT "$sanitized_path" "$target_link" || {
-        printf "${RC}Error: Failed to register key${NC}\n"
+        printf "${RC}Error: Failed to register key (create symlink)${NC}\n"
         return 1
     }
+    # Only print "registered" if it wasn't already printed, or to confirm link update
+    if ! printf "%s" "${target_link_existed_before}" | grep -q "true" || [ "$(readlink -f "$target_link")" != "$sanitized_path" ]; then
+        printf "${GC}Key '%s' registered (symlink created/updated).${NC}\n" "$sanitized_path"
+    fi
 
-    printf "${GC}Key '%s' registered.${NC}\n" "$sanitized_path"
 
     local ssh_passphrase=""
     if ! ssh-keygen -y -f "$sanitized_path" -P "" >/dev/null 2>&1; then
@@ -1182,13 +1200,18 @@ _xkeys_add() {
 
         if ! ssh-keygen -y -f "$sanitized_path" -P "$ssh_passphrase" >/dev/null 2>&1; then
             printf "${RC}Error: Invalid SSH key passphrase${NC}\n"
+            # Potentially remove symlink if this is a new add that failed passphrase setup?
+            # For now, leave symlink but passphrase setup failed.
             return 1
         fi
 
-        printf "Enter Master Password to encrypt this key: "
-        read -s master_password
-        echo
-        MASTER_PASSWORD_CACHE="$master_password"
+        if [ -z "$MASTER_PASSWORD_CACHE" ]; then # Prompt if not already cached (e.g. from a failed retrieve_passphrase earlier)
+            printf "Enter Master Password to encrypt this key: "
+            read -s master_password
+            echo
+            MASTER_PASSWORD_CACHE="$master_password"
+        fi
+
 
         local kek
         kek=$(derive_kek "$MASTER_PASSWORD_CACHE")
@@ -1200,24 +1223,23 @@ _xkeys_add() {
         chmod 400 "$passphrase_file"
         printf "${GC}Passphrase for %s encrypted and saved.${NC}\n" "$sanitized_path"
     else
-        printf "${GY}Warning: Non-encrypted key registered${NC}\n"
+        printf "${GY}Warning: Non-encrypted key registered (no passphrase needed from xkeys).${NC}\n"
     fi
 
-    # Initialize agent if needed
     if ! check_ssh_agent; then
         init_ssh_agent || return 1
     fi
 
-    # Add the key to the agent
     if [[ -n "$ssh_passphrase" ]]; then
         add_key_to_agent "$sanitized_path" "$ssh_passphrase" && {
-            printf "${GC}Successfully loaded key.${NC}\n"
+            printf "${GC}Successfully loaded key into agent.${NC}\n"
         }
-    else
+    else # Non-encrypted key
         ssh-add "$sanitized_path" >/dev/null 2>&1 && {
-            printf "${GC}Successfully loaded key.${NC}\n"
+            printf "${GC}Successfully loaded non-encrypted key into agent.${NC}\n"
         }
     fi
+    # Return status of add_key_to_agent or ssh-add will be the function's status
 }
 
 # Remove key from xkeys management
@@ -1344,7 +1366,7 @@ _xkeys_complete() {
             ;;
         "add")
            # Find SSH private key files and exclude .pub
-           local key_pattern='id_*[^.pub]'
+           local key_pattern='id_*'
            if [ -d "$SSH_DIR" ]; then
                local keys=()
                while IFS= read -r key; do
