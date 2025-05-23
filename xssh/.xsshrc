@@ -30,6 +30,9 @@ p+ () {
 # HELP: uses xssh by default instead of ssh (use \ssh if you want the plain ssh)
 #alias ssh='xssh'
 #alias xssh='xssh -NOMOTD'
+#alias tmux='tmux -f $XH/.tmux.conf'
+export TMUX_CONF="${XH:-$HOME}/.tmux.conf"
+alias tmux="tmux -f $TMUX_CONF"
 
 # HELP: history | grep 
 alias ,hg='history|grep'
