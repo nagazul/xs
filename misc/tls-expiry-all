@@ -1,0 +1,142 @@
+#!/bin/bash
+
+# Ensure script fails on any error
+set -e
+
+# Global variables with absolute paths for cron compatibility
+HOME=${HOME:-/root}
+SSH_CONFIG_DIR="$HOME/.ssh"
+OUTPUT_FILE="/var/lib/prometheus/node-exporter/ssl_all.prom"
+ERROR_LOG="/tmp/ssl-all.err"
+SSL_CHECK_BIN=$(command -v tls-expiry-check)
+XKEYS_SCRIPT="/root/.xkeys"
+
+# Ensure proper PATH for cron
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+# Source xkeys if it’s a script
+if [ -f "$XKEYS_SCRIPT" ]; then
+    . "$XKEYS_SCRIPT"
+else
+    echo "Error: xkeys script not found at $XKEYS_SCRIPT" >&2
+    exit 1
+fi
+
+# Add lock file handling to prevent concurrent runs
+LOCK_FILE="/tmp/tls-expiry.lock"
+
+# Show usage information
+show_usage() {
+    cat << EOF
+Usage: $(basename $0) [-w|--write] [--cron] [--help]
+
+Options:
+    -w, --write     Write output to files instead of stdout
+                    ($OUTPUT_FILE and $ERROR_LOG)
+    --cron          Run in cron mode (implies --write, skips if no agent)
+    --help          Show this help message
+
+When run with -w or --cron, output goes to $OUTPUT_FILE
+and errors go to $ERROR_LOG.
+Without these options, output goes to stdout/stderr.
+
+Note: Ensure SSH agent is running using 'xkeys status' or 'xkeys load'
+EOF
+}
+
+# Function to cleanup
+cleanup() {
+    # Remove lock file
+    rm -f "$LOCK_FILE"
+}
+
+# Function to check SSL certificates
+check_certificates() {
+    # Verify ssh config exists
+    if [ ! -f "$SSH_CONFIG_DIR/config" ]; then
+        echo "Error: SSH config file not found" >&2
+        exit 1
+    fi
+
+    for host in $(grep -E "^Host [^*?]+$" "$SSH_CONFIG_DIR/config" | awk '{print $2}'); do
+        # Test SSH connection before attempting operations
+        if ! ssh -q -o BatchMode=yes -o ConnectTimeout=5 ntt-debug@$host exit >/dev/null 2>&1; then
+            echo "Warning: Cannot connect to $host, skipping..." >&2
+            continue
+        fi
+
+        for cert in $(ssh ntt-debug@$host find /opt/sensorbox -type f -name \*.crt -o -name \*.pem 2>/dev/null); do
+            ssh ntt-debug@$host cat "$cert" 2>/dev/null | "$SSL_CHECK_BIN" -p -m "$host-$(basename "$cert")" -
+        done
+    done
+}
+
+# Main function
+main() {
+    local write_to_file=0
+    local cron_mode=0
+
+    # Parse command line arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -w|--write)
+                write_to_file=1
+                shift
+                ;;
+            --cron)
+                cron_mode=1
+                write_to_file=1  # Cron mode implies write mode
+                shift
+                ;;
+            --help)
+                show_usage
+                exit 0
+                ;;
+            *)
+                echo "Unknown option: $1" >&2
+                show_usage
+                exit 1
+                ;;
+        esac
+    done
+
+    # Initialize or check SSH agent using xkeys
+    if ! xkeys status >/dev/null 2>&1; then
+        if [ $cron_mode -eq 1 ]; then
+            exit 0  # Silent exit in cron mode if no agent
+        else
+            xkeys load || { echo "No working SSH agent found. Use 'xkeys load' to initialize one." >&2; exit 1; }
+        fi
+    fi
+
+    # Check if script is already running
+    if [ -f "$LOCK_FILE" ]; then
+        if ps -p $(cat "$LOCK_FILE") >/dev/null 2>&1; then
+            echo "Script is already running" >&2
+            exit 1
+        fi
+        rm -f "$LOCK_FILE"
+    fi
+
+    # Create lock file
+    echo $$ > "$LOCK_FILE"
+
+    # Ensure cleanup runs on script exit
+    trap cleanup EXIT
+
+    # Run the certificate checks
+    if [ $write_to_file -eq 1 ]; then
+        # Write mode: output to files
+        mkdir -p "$(dirname "$OUTPUT_FILE")"
+        check_certificates > "$OUTPUT_FILE.tmp" 2>"$ERROR_LOG"
+        mv "$OUTPUT_FILE.tmp" "$OUTPUT_FILE"
+    else
+        # Interactive mode: display output
+        check_certificates
+    fi
+}
+
+# Run main function with all arguments
+main "$@"
+
