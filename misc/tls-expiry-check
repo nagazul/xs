@@ -1,0 +1,209 @@
+#!/bin/bash
+# ROC3 @clneagu
+
+# Default settings
+TIMEOUT=3
+PROMETHEUS_OUTPUT=false
+CUSTOM_MESSAGE=""
+SCRIPT_NAME=$(basename "$0")
+
+# Usage information
+usage() {
+    cat << EOF
+Usage: $SCRIPT_NAME [-p] [-t TIMEOUT] [-m MESSAGE] TARGET [PORT]
+Check SSL certificate expiration for domains or certificate files
+
+Options:
+    -p          Output in Prometheus format
+    -t TIMEOUT  Set connection timeout in seconds (default: 3)
+    -m MESSAGE  Custom message/label for STDIN input (used with "-" as TARGET)
+    -h          Show this help message
+
+Arguments:
+    TARGET      Domain name or certificate file path
+                Use "-" to read certificate from STDIN
+    PORT        Optional port number (default: checks both 443 and 5044)
+
+Examples:
+    $SCRIPT_NAME example.com
+    $SCRIPT_NAME -p example.com 443
+    $SCRIPT_NAME /path/to/cert.pem
+    cat cert.pem | $SCRIPT_NAME -
+    cat cert.pem | $SCRIPT_NAME -m "Production API Cert" -
+    openssl s_client -connect example.com:443 | $SCRIPT_NAME -m "Example.com Cert" -
+EOF
+    exit 1
+}
+
+# Parse command line options
+while getopts "pt:m:h" opt; do
+    case $opt in
+        p) PROMETHEUS_OUTPUT=true ;;
+        t) TIMEOUT="$OPTARG" ;;
+        m) CUSTOM_MESSAGE="$OPTARG" ;;
+        h) usage ;;
+        \?) usage ;;
+    esac
+done
+
+# Shift past the options
+shift $((OPTIND-1))
+
+# Check if target is provided
+if [ $# -lt 1 ]; then
+    usage
+fi
+
+# Function to validate input
+validate_input() {
+    local input="$1"
+    if [[ ! "$input" =~ ^[a-zA-Z0-9.-]+$ ]] && [ "$input" != "-" ]; then
+        echo "Error: Invalid input format. Use only alphanumeric characters, dots, and hyphens."
+        exit 1
+    fi
+}
+
+# Function to calculate days until expiration
+check_ssl_expiry() {
+    local expiry_date="$1"
+    local now
+    now=$(date +%s)
+    local days_until_expiry=$(( (expiry_date - now) / 86400 ))
+    echo "$days_until_expiry"
+}
+
+# Function to output results
+output_result() {
+    local domain="$1"
+    local port="$2"
+    local days="$3"
+    local error="$4"
+    local timestamp
+    timestamp=$(date +%s)
+
+    # Use custom message for stdin if provided
+    if [ "$domain" = "stdin" ] && [ -n "$CUSTOM_MESSAGE" ]; then
+        domain="$CUSTOM_MESSAGE"
+    fi
+
+    if [ "$PROMETHEUS_OUTPUT" = true ]; then
+        local metric_name="ssl_cert"
+        if [ -n "$error" ]; then
+			:
+            #echo "${metric_name}_check_up{source=\"${domain}\",port=\"${port}\"} 0"
+        else
+            #echo "${metric_name}_check_up{source=\"${domain}\",port=\"${port}\"} 1"
+            echo "${metric_name}_days_until_expiry{source=\"${domain}\",port=\"${port}\"} $days"
+        fi
+    else
+        if [ -n "$error" ]; then
+            if [ "$error" = "timeout" ]; then
+                echo "Error: Connection to ${domain}:${port} timed out after ${TIMEOUT} seconds"
+            else
+                echo "Error: $error"
+            fi
+        else
+            if [ "$port" = "file" ] || [ "$port" = "stdin" ]; then
+                echo "SSL certificate for '$domain' expires in $days days."
+            else
+                echo "SSL certificate for $domain on port $port expires in $days days."
+            fi
+        fi
+    fi
+}
+
+# Function to process certificate data
+process_certificate() {
+    local source="$1"
+    local source_type="$2"
+    local temp_cert
+    local expiry_date
+
+    # Create temporary file for certificate
+    temp_cert=$(mktemp)
+    trap 'rm -f "$temp_cert"' EXIT
+
+    # Process based on source type
+    case "$source_type" in
+        "stdin")
+            # Read from stdin and extract certificate
+            if ! openssl x509 > "$temp_cert" 2>/dev/null; then
+                output_result "stdin" "stdin" "" "Could not parse certificate from STDIN"
+                return 1
+            fi
+            ;;
+        "file")
+            # Copy file to temp location
+            if ! cp "$source" "$temp_cert" 2>/dev/null; then
+                output_result "$source" "file" "" "Could not read certificate file"
+                return 1
+            fi
+            ;;
+    esac
+
+    # Extract expiry date
+    expiry_date=$(openssl x509 -noout -enddate -in "$temp_cert" 2>/dev/null | cut -d'=' -f2)
+    if [[ -z "$expiry_date" ]]; then
+        output_result "${source:-stdin}" "${source_type}" "" "Could not parse certificate expiry date"
+        return 1
+    fi
+
+    expiry_epoch=$(date -d "$expiry_date" +%s)
+    days_until_expiry=$(check_ssl_expiry "$expiry_epoch")
+    output_result "${source:-stdin}" "${source_type}" "$days_until_expiry"
+}
+
+# Function to get SSL expiry for a specific domain and port
+get_ssl_expiry() {
+    local domain="$1"
+    local port="$2"
+    local temp_cert
+    local expiry_date
+    local expiry_epoch
+    local days_until_expiry
+
+    # Create temporary file for certificate
+    temp_cert=$(mktemp)
+    trap 'rm -f "$temp_cert"' EXIT
+
+    # Attempt to retrieve certificate
+    if ! timeout "$TIMEOUT" openssl s_client -connect "$domain:$port" -servername "$domain" </dev/null 2>/dev/null | \
+         openssl x509 > "$temp_cert" 2>/dev/null; then
+        output_result "$domain" "$port" "" "timeout"
+        return 1
+    fi
+
+    # Extract expiry date
+    expiry_date=$(openssl x509 -noout -enddate -in "$temp_cert" 2>/dev/null | cut -d'=' -f2)
+    if [[ -z "$expiry_date" ]]; then
+        output_result "$domain" "$port" "" "Could not parse certificate expiry date"
+        return 1
+    fi
+
+    expiry_epoch=$(date -d "$expiry_date" +%s)
+    days_until_expiry=$(check_ssl_expiry "$expiry_epoch")
+    output_result "$domain" "$port" "$days_until_expiry"
+}
+
+# Main logic
+TARGET="$1"
+
+if [ "$TARGET" = "-" ]; then
+    # Process certificate from stdin
+    process_certificate "" "stdin"
+elif [[ -f "$TARGET" ]]; then
+    # Process certificate file
+    process_certificate "$TARGET" "file"
+else
+    # Process domain
+    validate_input "$TARGET"
+    if [ $# -ge 2 ]; then
+        # Check specific port
+        get_ssl_expiry "$TARGET" "$2"
+    else
+        # Check both standard ports
+        get_ssl_expiry "$TARGET" 443
+        #get_ssl_expiry "$TARGET" 5044
+    fi
+fi
+
