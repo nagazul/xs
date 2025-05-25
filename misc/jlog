@@ -1,0 +1,60 @@
+#!/bin/bash
+
+# Script to extract distinct SSH users from journalctl on each SSH config host in parallel
+# Usage: ./jlog [days_to_look_back]
+
+set -e
+
+# Default days
+DAYS=7
+
+# Parse argument
+if [[ $# -gt 0 ]] && [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -gt 0 ]; then
+    DAYS=$1
+fi
+
+# SSH config path
+SSH_CONFIG="$HOME/.ssh/config"
+
+# Check if SSH config exists
+[ -f "$SSH_CONFIG" ] || { echo "Error: SSH config not found at $SSH_CONFIG" >&2; exit 1; }
+
+# Ignore list pattern (e.g., xyz-debug) - matches 3 letters, a hyphen, then "debug"
+IGNORE_USERS_PATTERN="[a-zA-Z]{3}-debug" # Changed variable name for clarity
+
+# Temporary directory for results
+TEMP_DIR=$(mktemp -d) || { echo "Error: Cannot create temp directory" >&2; exit 1; }
+trap 'rm -rf "$TEMP_DIR"' EXIT
+
+# Extract hosts from SSH config and run command in parallel
+pids=()
+for host in $(grep -E "^Host [^*?]+$" "$SSH_CONFIG" | awk '{print $2}'); do
+    # Temporary file for this host
+    TEMP_FILE="$TEMP_DIR/$host"
+
+    # Run in background
+    (
+        if ssh -q -o BatchMode=yes -o ConnectTimeout=5 "$host" exit 2>/dev/null; then
+            ssh "$host" "sudo journalctl -u ssh --since '$DAYS days ago' --no-pager 2>/dev/null | grep 'Accepted' | awk '{for(i=1;i<=NF;i++) if(\$i==\"for\") print \$(i+1)}'" 2>/dev/null > "$TEMP_FILE"
+        else
+            echo "Warning: Cannot connect to $host, skipping..." >&2
+            touch "$TEMP_FILE"  # Empty file to indicate skip
+        fi
+    ) &
+    pids+=($!)
+done
+
+# Wait for all background jobs to complete
+for pid in "${pids[@]}"; do
+    wait "$pid"
+done
+
+# Process and display results
+for host in $(grep -E "^Host [^*?]+$" "$SSH_CONFIG" | awk '{print $2}'); do
+    TEMP_FILE="$TEMP_DIR/$host"
+    if [ -s "$TEMP_FILE" ]; then
+        # The grep command uses ^ and $ to ensure the pattern matches the whole username
+        users=$(sort -u "$TEMP_FILE" | grep -v -E "^${IGNORE_USERS_PATTERN}$" | tr '\n' ' ' | sed 's/ $//')
+        [ -n "$users" ] && printf "%-15s: %s\n" "$host" "$users"
+    fi
+done
