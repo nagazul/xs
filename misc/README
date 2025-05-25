@@ -1,0 +1,3 @@
+# execute check_users on matching remote hosts
+xrun @[alhg-f:-2],@[bwo]
+xrun @[alhg-f:-2],@[bwo] < check_users
