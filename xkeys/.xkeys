@@ -1308,6 +1308,17 @@ xkeys() {
                 return 1
             fi
             ;;
+        status)
+            if check_ssh_agent; then
+                # Optional: Output a status message if not running silently
+                # log_user 0 is not set here, so printf will go to stdout
+                # printf "${GC}SSH agent is running (PID: %s).${NC}\n" "$SSH_AGENT_PID"
+                return 0 # Success
+            else
+                # printf "${RC}SSH agent is not running or not responding.${NC}\n"
+                return 1 # Failure
+            fi
+            ;;
         verify)
             _xkeys_verify_keys
             ;;
