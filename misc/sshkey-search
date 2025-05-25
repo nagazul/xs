@@ -1,0 +1,197 @@
+#!/bin/bash
+
+# --- Configuration ---
+SEARCH_DIRS=("/home" "/root")
+MIN_SIZE_BYTES=200
+MAX_SIZE_BYTES=8192
+CMD_TIMEOUT_SSHKEYGEN="3s"
+CMD_TIMEOUT_HEAD="2s"
+DEFAULT_MAX_DEPTH=7
+DEFAULT_EXCLUDE_NAMES=(".cache" ".git" ".tmux" ".local")
+
+# --- Colors ---
+COLOR_GREEN='\033[0;32m'
+COLOR_RED='\033[0;31m'
+COLOR_WHITE='\033[0;37m'
+COLOR_RESET='\033[0m'
+
+# --- Default Options ---
+KEY_TYPE_FILTER="private"
+DEBUG_MODE="false"
+USE_MAX_DEPTH_LIMIT=true
+EXCLUDE_DEFAULT_DIRS_FLAG=true
+
+# --- Functions ---
+display_help() {
+  echo "SSH Key Scanner"
+  echo
+  echo "Description:"
+  echo "  This script scans specified directories (${SEARCH_DIRS[*]}) for SSH keys."
+  echo "  It identifies private and public keys, and for private keys, attempts"
+  echo "  to determine if they are encrypted or plaintext. Output is color-coded."
+  echo "  By default, common cache/VCS directories (${DEFAULT_EXCLUDE_NAMES[*]}) are excluded."
+  echo
+  echo "Usage:"
+  echo "  sudo $0 [options]"
+  echo
+  echo "Options:"
+  echo "  --private         Show private keys only (this is the default behavior)."
+  echo "  --public          Show public keys, certificates, and key collections"
+  echo "                    (e.g., authorized_keys)."
+  echo "  --deep            Perform a deep scan, searching through all subdirectory levels."
+  echo "                    Overrides the default depth limit of $DEFAULT_MAX_DEPTH levels."
+  echo "  --all             Include all directories in the scan, overriding default"
+  echo "                    exclusions (like ${DEFAULT_EXCLUDE_NAMES[*]})."
+  echo "  --debug           Enable verbose debugging output to stderr."
+  echo "  --help            Display this help message and exit."
+  echo
+  echo "Output Colors (Path Only):"
+  echo -e "  ${COLOR_GREEN}path${COLOR_RESET}        Indicates an Encrypted Private Key."
+  echo -e "  ${COLOR_RED}path${COLOR_RESET}        Indicates a Plaintext Private Key (or if its encryption"
+  echo "              status check failed or timed out, treated as potentially unsafe)."
+  echo -e "  ${COLOR_WHITE}path${COLOR_RESET}        Indicates a Public Key, SSH Certificate, or Key Collection."
+  echo
+  echo "Important:"
+  echo "  This script should be run with sudo for full access to all user"
+  echo "  home directories and /root."
+}
+
+# --- Argument Parsing ---
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --private) KEY_TYPE_FILTER="private"; shift ;;
+    --public) KEY_TYPE_FILTER="public"; shift ;;
+    --deep) USE_MAX_DEPTH_LIMIT=false; shift ;;
+    --all) EXCLUDE_DEFAULT_DIRS_FLAG=false; shift ;;
+    --debug) DEBUG_MODE="true"; shift ;;
+    --help) display_help; exit 0 ;;
+    *)
+      if [[ "$1" == --* ]]; then echo "Unknown option: $1" >&2; display_help; exit 1; fi
+      break ;;
+  esac
+done
+
+if [[ "$DEBUG_MODE" == "true" ]]; then echo "DEBUG: Debug mode enabled." >&2; fi
+
+is_ssh_key_detailed_classifier() {
+  local file_path="$1"; local keygen_exit_code head_exit_code
+  local determined_file_category="unknown" encryption_status="N/A"
+  if [[ "$DEBUG_MODE" == "true" ]]; then echo "DEBUG (classifier): Analyzing '$file_path'" >&2; fi
+
+  timeout "$CMD_TIMEOUT_SSHKEYGEN" ssh-keygen -l -f "$file_path" >/dev/null 2>&1; keygen_exit_code=$?
+  if [ $keygen_exit_code -ne 0 ]; then
+    if [[ "$DEBUG_MODE" == "true" ]]; then echo "DEBUG (classifier): ssh-keygen -l failed (exit $keygen_exit_code) for '$file_path'" >&2; fi
+    echo "irrelevant_or_error_parsing"; return
+  fi
+
+  local first_line_data; first_line_data=$(timeout "$CMD_TIMEOUT_HEAD" head -n 1 "$file_path" 2>/dev/null); head_exit_code=$?
+  if [ $head_exit_code -ne 0 ]; then
+    if [[ "$DEBUG_MODE" == "true" ]]; then echo "DEBUG (classifier): head -n 1 failed (exit $head_exit_code) for '$file_path'" >&2; fi
+    echo "irrelevant_or_error_parsing"; return
+  fi
+
+  local head_data; head_data=$(timeout "$CMD_TIMEOUT_HEAD" head -n 5 "$file_path" 2>/dev/null); head_exit_code=$?
+  if [[ "$head_exit_code" -ne 0 && "$DEBUG_MODE" == "true" ]]; then
+    echo "DEBUG (classifier): head -n 5 failed for '$file_path'. Proc-Type check might be affected." >&2; head_data=""
+  fi
+
+  if echo "$first_line_data" | grep -q "PRIVATE KEY"; then
+    determined_file_category="private"
+    if echo "$head_data" | grep -q "Proc-Type: 4,ENCRYPTED"; then encryption_status="Encrypted"
+    else
+      timeout "$CMD_TIMEOUT_SSHKEYGEN" ssh-keygen -y -f "$file_path" -P "" >/dev/null 2>&1; keygen_exit_code=$?
+      if [ $keygen_exit_code -eq 0 ]; then encryption_status="Plaintext"
+      elif [ $keygen_exit_code -eq 124 ]; then encryption_status="Error"
+      else encryption_status="Encrypted"; fi
+    fi
+  elif echo "$first_line_data" | grep -qE -e "^ssh-(rsa|dss|ed25519)[[:space:]]" -e "^ecdsa-sha2-nistp[0-9]+[[:space:]]" -e "^sk-(ssh-ed25519|ecdsa-sha2-nistp[0-9]+)@openssh.com[[:space:]]"; then
+    determined_file_category="public_key"
+  else
+    timeout "$CMD_TIMEOUT_SSHKEYGEN" ssh-keygen -L -f "$file_path" >/dev/null 2>&1; keygen_exit_code=$?
+    if [ $keygen_exit_code -eq 0 ]; then determined_file_category="certificate"
+    elif [ $keygen_exit_code -ne 124 ]; then determined_file_category="key_collection"
+    else echo "irrelevant_or_error_parsing"; return; fi
+  fi
+
+  if [[ "$determined_file_category" == "private" ]]; then
+    if [[ "$encryption_status" == "Encrypted" ]]; then echo "private_encrypted"
+    elif [[ "$encryption_status" == "Plaintext" ]]; then echo "private_plaintext"
+    else echo "private_error_status"; fi
+  elif [[ "$determined_file_category" == "public_key" || "$determined_file_category" == "certificate" || "$determined_file_category" == "key_collection" ]]; then
+    echo "public_material"
+  else echo "irrelevant_or_error_parsing"; fi
+}
+
+# --- Main Script ---
+if [ "$(id -u)" -ne 0 ]; then
+  echo -e "${COLOR_RED}Warning: Run with sudo for full access.${COLOR_RESET}" >&2; echo "---" >&2
+fi
+
+echo "Starting SSH key search..." >&2
+echo -n "Mode: " >&2; if [[ "$KEY_TYPE_FILTER" == "private" ]]; then echo "Private Keys Only"; else echo "Public Keys/Material Only"; fi >&2
+echo -n "Search depth: " >&2; if [[ "$USE_MAX_DEPTH_LIMIT" == "true" ]]; then echo "Limited to $DEFAULT_MAX_DEPTH levels."; else echo "Unlimited (--deep)."; fi >&2
+echo -n "Default Exclusions: " >&2; if [[ "$EXCLUDE_DEFAULT_DIRS_FLAG" == "true" ]]; then echo "${DEFAULT_EXCLUDE_NAMES[*]} skipped."; else echo "Disabled (--all)."; fi >&2
+if [[ "$DEBUG_MODE" == "true" ]]; then echo "DEBUG: Timeouts: ssh-keygen $CMD_TIMEOUT_SSHKEYGEN, head $CMD_TIMEOUT_HEAD." >&2; fi
+echo "--------------------------------------------------" >&2
+
+found_and_printed_count=0
+for search_dir in "${SEARCH_DIRS[@]}"; do
+  if [ ! -d "$search_dir" ]; then
+    if [[ "$DEBUG_MODE" == "true" ]]; then echo "DEBUG (main): Dir '$search_dir' not found. Skipping." >&2; fi
+    echo "Notice: Dir '$search_dir' not found. Skipping." >&2; continue
+  fi
+  if [[ "$DEBUG_MODE" == "true" ]]; then echo "DEBUG (main): Searching in '$search_dir'..." >&2; fi
+
+  find_args=("$search_dir" "-mindepth" "1")
+  if [[ "$USE_MAX_DEPTH_LIMIT" == "true" ]]; then find_args+=("-maxdepth" "$DEFAULT_MAX_DEPTH"); fi
+
+  if [[ "$EXCLUDE_DEFAULT_DIRS_FLAG" == "true" && ${#DEFAULT_EXCLUDE_NAMES[@]} -gt 0 ]]; then
+    # Chained pruning conditions to avoid parenthesized OR-group for names
+    for exclude_name in "${DEFAULT_EXCLUDE_NAMES[@]}"; do
+      find_args+=("-name" "$exclude_name" "-type" "d" "-prune")
+      find_args+=("-o") # Each prune clause is OR'd with the next, or ultimately with the action
+    done
+    if [[ "$DEBUG_MODE" == "true" ]]; then
+      echo "DEBUG (main): Using chained prune conditions..." >&2
+    fi
+  fi
+
+  find_args+=("-type" "f")
+  find_args+=("-size" "+$((MIN_SIZE_BYTES - 1))c"); find_args+=("-size" "-$((MAX_SIZE_BYTES + 1))c")
+  find_args+=("-print0")
+
+  if [[ "$DEBUG_MODE" == "true" ]]; then
+    printf "DEBUG (main): Executing find with args: " >&2; printf "'%s' " "${find_args[@]}" >&2; printf "\n" >&2
+    find_debug_output_capture=$(find "${find_args[@]}" 2>&1)
+    find_debug_exit_code=$?
+    echo "DEBUG (main): find command exit code: $find_debug_exit_code" >&2
+    if [[ -n "$find_debug_output_capture" ]]; then
+      echo "DEBUG (main): find command raw output/stderr (first 500 chars):" >&2
+      head -c 500 <<< "$find_debug_output_capture" >&2; echo -e "\nDEBUG (main): End of find raw output sample." >&2
+    else echo "DEBUG (main): find command produced no output (stdout/stderr)." >&2; fi
+  fi
+  
+  while IFS= read -r -d $'\0' potential_key_file; do
+    if [[ "$DEBUG_MODE" == "true" ]]; then echo "DEBUG (main loop): Processing: '$potential_key_file'" >&2; fi
+    classification_result=$(is_ssh_key_detailed_classifier "$potential_key_file")
+    if [[ "$DEBUG_MODE" == "true" ]]; then echo "DEBUG (main loop): Classification for '$potential_key_file' is '$classification_result'" >&2; fi
+
+    color_to_use=""; print_this_file=false
+    case "$classification_result" in
+      "private_encrypted") if [[ "$KEY_TYPE_FILTER" == "private" ]]; then color_to_use="$COLOR_GREEN"; print_this_file=true; fi ;;
+      "private_plaintext"|"private_error_status") if [[ "$KEY_TYPE_FILTER" == "private" ]]; then color_to_use="$COLOR_RED"; print_this_file=true; fi ;;
+      "public_material") if [[ "$KEY_TYPE_FILTER" == "public" ]]; then color_to_use="$COLOR_WHITE"; print_this_file=true; fi ;;
+    esac
+    if [[ "$print_this_file" == true ]]; then
+      echo -e "${color_to_use}${potential_key_file}${COLOR_RESET}"; ((found_and_printed_count++))
+    fi
+  done < <(find "${find_args[@]}" 2>/dev/null)
+  if [[ "$DEBUG_MODE" == "true" ]]; then echo "DEBUG (main): Finished find/loop for '$search_dir'." >&2; fi
+done
+
+echo "--------------------------------------------------" >&2
+echo "Search complete. $found_and_printed_count file(s) matched filter and printed." >&2
+if [[ "$DEBUG_MODE" == "true" ]]; then echo "DEBUG: Script finished." >&2; fi
+if [ "$(id -u)" -ne 0 ]; then
+  echo -e "${COLOR_RED}Reminder: Re-run with sudo for comprehensive results.${COLOR_RESET}" >&2
+fi
