@@ -1,0 +1,465 @@
+#!/bin/bash
+
+# Enhanced SSH Log Analyzer with Normalized Dates
+# Usage: ./slog [days_to_look_back] [-f|--follow] [-v|--verbose] [-o|--output file]
+
+# Define color variables
+GC='\033[0;32m' # Green
+BC='\033[0;34m' # Blue
+YC='\033[0;33m' # Yellow
+RC='\033[0;31m' # Red
+CC='\033[0;36m' # Cyan
+NC='\033[0m'    # No Color
+
+# Default values
+DAYS=7
+FOLLOW_MODE=0
+VERBOSE=0
+OUTPUT_FILE=""
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -f|--follow) FOLLOW_MODE=1; shift ;;
+        -v|--verbose) VERBOSE=1; shift ;;
+        -o|--output) OUTPUT_FILE="$2"; shift 2 ;;
+        -h|--help)
+            echo "Usage: $0 [days] [-f|--follow] [-v|--verbose] [-o|--output file]"
+            echo "  days: Number of days to look back (default: 7)"
+            echo "  -f: Enable real-time monitoring"
+            echo "  -v: Enable verbose output"
+            echo "  -o: Save output to specified file"
+            exit 0 ;;
+        [0-9]*) DAYS=$1; shift ;;
+        *) echo -e "${RC}Error: Unknown option $1${NC}"; exit 1 ;;
+    esac
+done
+
+# Validate DAYS
+if ! [[ "$DAYS" =~ ^[0-9]+$ ]] || [ "$DAYS" -le 0 ]; then
+    echo -e "${RC}Error: Days must be a positive integer${NC}"
+    exit 1
+fi
+
+# Create temp directory
+TEMP_DIR=$(mktemp -d 2>/dev/null) || { echo -e "${RC}Error: Cannot create temp directory${NC}"; exit 1; }
+trap 'rm -rf "$TEMP_DIR"' EXIT # Cleanup temp directory on exit
+
+MERGED_LOG="${TEMP_DIR}/merged_ssh.log"
+PROCESSED_LOG="${TEMP_DIR}/processed_ssh.log" # Used for intermediate processing
+
+# Redirect output to file if specified
+# This will tee output to both stdout and the file
+if [ -n "$OUTPUT_FILE" ]; then
+    exec > >(tee -a "$OUTPUT_FILE") 2>&1
+fi
+
+echo -e "${BC}===== SSH Connection Analysis - Last $DAYS Days =====${NC}"
+echo -e "${CC}Collecting data from system logs...${NC}"
+
+# Function to handle usernames (no longer fixes specific truncated ones)
+fix_truncated_username() {
+    local username="$1"
+    case "$username" in
+        ""|" ") echo "unknown" ;; # Handle empty or space-only usernames
+        *) echo "$username" ;;    # Return all other usernames as is
+    esac
+}
+
+# Function to normalize date to YYYY-MM-DD HH:MM:SS
+normalize_date() {
+    local date_str="$1"
+    local current_year=$(date +%Y)
+    local current_month=$(date +%m)
+    local current_day=$(date +%d)
+    local year month day time month_num
+
+    # Try to parse common log date formats
+    # Format 1: "Mar  3 09:26:49" or "Mar 3 09:26:49" (note potential double space)
+    if [[ "$date_str" =~ ^([A-Za-z]{3})[[:space:]]+([0-9]{1,2})[[:space:]]+([0-9]{2}:[0-9]{2}:[0-9]{2}) ]]; then
+        month="${BASH_REMATCH[1]}"
+        day="${BASH_REMATCH[2]}"
+        time="${BASH_REMATCH[3]}"
+    # Format 2: "Tue Feb 25 07:38:46"
+    elif [[ "$date_str" =~ ^[A-Za-z]{3}[[:space:]]+([A-Za-z]{3})[[:space:]]+([0-9]{1,2})[[:space:]]+([0-9]{2}:[0-9]{2}:[0-9]{2}) ]]; then
+        month="${BASH_REMATCH[1]}"
+        day="${BASH_REMATCH[2]}"
+        time="${BASH_REMATCH[3]}"
+    # Format 3: Journalctl default format like "May 25 19:43:00" (assumes current year)
+    # This is already covered by Format 1, but good to note.
+    # Format 4: `last -F` style "Mon May 20 10:00:00 2024"
+    elif [[ "$date_str" =~ ^[A-Za-z]{3}[[:space:]]+([A-Za-z]{3})[[:space:]]+([0-9]{1,2})[[:space:]]+([0-9]{2}:[0-9]{2}:[0-9]{2})[[:space:]]+([0-9]{4}) ]]; then
+        month="${BASH_REMATCH[1]}"
+        day="${BASH_REMATCH[2]}"
+        time="${BASH_REMATCH[3]}"
+        year="${BASH_REMATCH[4]}"
+    else
+        # Fallback for unrecognized date formats - try to use 'date' command for robust parsing
+        parsed_date_seconds=$(date -d "$date_str" +%s 2>/dev/null)
+        if [[ $? -eq 0 ]]; then
+            echo "$(date -d "@$parsed_date_seconds" +"%Y-%m-%d %H:%M:%S")"
+            return
+        else
+            # Ultimate fallback if 'date -d' fails or format is too weird
+            if [ "$VERBOSE" -eq 1 ]; then
+                echo -e "      ${YC}Warning: Could not parse date string '$date_str'. Using default. ${NC}" >&2
+            fi
+            echo "$current_year-01-01 00:00:00" # Default to start of current year
+            return
+        fi
+    fi
+
+    # Ensure day is two digits with leading zero if needed
+    day=$(printf "%02d" "$((10#$day))") # Force decimal interpretation and pad with 0
+
+    # Convert month name to number
+    case "$month" in
+        Jan) month_num="01";; Feb) month_num="02";; Mar) month_num="03";; Apr) month_num="04";;
+        May) month_num="05";; Jun) month_num="06";; Jul) month_num="07";; Aug) month_num="08";;
+        Sep) month_num="09";; Oct) month_num="10";; Nov) month_num="11";; Dec) month_num="12";;
+        *)
+            if [ "$VERBOSE" -eq 1 ]; then
+                echo -e "      ${YC}Warning: Unknown month '$month' in date '$date_str'. Using 00. ${NC}" >&2
+            fi
+            month_num="00";;
+    esac
+
+    # If year was not parsed from the date string itself (formats 1, 2, 3)
+    if [ -z "$year" ]; then
+        # Adjust year based on current date to avoid future log entries from appearing as past year
+        if [ "$month_num" -gt "$current_month" ] || { [ "$month_num" -eq "$current_month" ] && [ "$day" -gt "$current_day" ]; }; then
+            year=$((current_year - 1))
+        else
+            year="$current_year"
+        fi
+    fi
+
+    echo "$year-$month_num-$day $time"
+}
+
+
+# Function to process log entries
+process_log_entry() {
+    local line="$1" source="$2" output_file="$3"
+    local raw_date_candidate
+    # For `last -F` output (like "Mon May 20 10:00:00 2024")
+    if [[ "$source" == "WTMP" ]]; then
+        # Example 'last -F' line: "user  pts/0  1.2.3.4  Mon May 20 10:00:00 2024 - 10:05 (00:05)"
+        # Or for "still logged in": "user  pts/0  1.2.3.4  Mon May 20 10:00:00 2024   still logged in"
+        # Awk fields $4, $5, $6, $7, $8 should capture "Day Mon DD HH:MM:SS YYYY"
+        raw_date_candidate=$(echo "$line" | awk '{print $4, $5, $6, $7, $8}')
+    else # For auth.log / journalctl
+         # Extract the date part more reliably, typically the first 3-4 fields
+        raw_date_candidate=$(echo "$line" | awk '{print $1, $2, $3, $4}' | sed -E 's/^([A-Za-z]{3}[[:space:]]+[A-Za-z]{3}[[:space:]]+[0-9]{1,2}[[:space:]]+[0-9]{2}:[0-9]{2}:[0-9]{2}).*/\1/' ) # For "Day Mon DD HH:MM:SS"
+        if [[ ! "$raw_date_candidate" =~ [0-9]{2}:[0-9]{2}:[0-9]{2} ]]; then # Check if time is captured
+             raw_date_candidate=$(echo "$line" | awk '{print $1, $2, $3}' | sed -E 's/^([A-Za-z]{3}[[:space:]]+[0-9]{1,2}[[:space:]]+[0-9]{2}:[0-9]{2}:[0-9]{2}).*/\1/') # For "Mon DD HH:MM:SS"
+        fi
+    fi
+
+    local date=$(normalize_date "$raw_date_candidate")
+    local event username ip
+
+    if echo "$line" | grep -q "Accepted publickey for"; then
+        event="Login success (pubkey)"
+        username=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i=="for") print $(i+1)}')
+        ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i=="from") print $(i+1)}')
+    elif echo "$line" | grep -q "Accepted password for"; then
+        event="Login success (passwd)"
+        username=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i=="for") print $(i+1)}')
+        ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i=="from") print $(i+1)}')
+    elif echo "$line" | grep -q "Failed password for"; then
+        event="Login failed (passwd)"
+        if echo "$line" | grep -q "invalid user"; then
+            username=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i=="user") print $(i+1)}') # Captures user after "invalid user"
+        else
+            username=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i=="for") print $(i+1)}')
+        fi
+        ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i=="from") print $(i+1)}')
+    elif echo "$line" | grep -q "Disconnecting from authenticating user"; then
+        event="Login failed (disconn)"
+        username=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i=="user") print $(i+1)}')
+        ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i=="port") print $(i-1)}')
+    elif echo "$line" | grep -q "Connection closed by authenticating user"; then
+        event="Login failed (closed)"
+        username=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i=="user") print $(i+1)}')
+        ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i=="port") print $(i-1)}')
+    elif echo "$line" | grep -q "Invalid user"; then
+        event="Login failed (inv_user)"
+        username=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i=="user") print $(i+1)}')
+        ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i=="from") print $(i+1)}')
+    elif echo "$line" | grep -q "pam_unix(sshd:session): session opened for user"; then
+        event="Session opened"
+        username=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i=="user") print $(i+1)}')
+        username=$(echo "$username" | sed 's/(uid=.*//')
+        ip="N/A"
+    elif echo "$line" | grep -q "pam_unix(sshd:session): session closed for user"; then
+        event="Session closed"
+        username=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i=="user") print $(i+1)}')
+        ip="N/A"
+    else
+        return
+    fi
+
+    username=$(fix_truncated_username "$username")
+    [ -z "$ip" ] && ip="unknown"
+    ip=$(echo "$ip" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' || echo "$ip")
+
+
+    echo "$date|$source|$event|$username|$ip|$line" >> "$output_file"
+}
+
+# Collect logs
+collect_logs() {
+    local start_date_seconds=$(date -d "$DAYS days ago" +%s)
+
+    for log_file_pattern in /var/log/auth.log /var/log/auth.log.[0-9]* /var/log/secure /var/log/secure.[0-9]*; do
+        eval "expanded_logs=(\"$log_file_pattern\")"
+        if [ -e "${expanded_logs[0]}" ]; then
+            for log in "${expanded_logs[@]}"; do
+                if [ -f "$log" ]; then
+                    [ "$VERBOSE" -eq 1 ] && echo -e "  ${BC}Reading from $log${NC}"
+                    zcat -f "$log" 2>/dev/null | grep -E "sshd\[[0-9]+\]: (Accepted|Failed|Invalid user|session opened for user|session closed for user|Disconnecting from|Connection closed by)" |
+                    while IFS= read -r line; do
+                        log_date_str=$(echo "$line" | awk '{print $1, $2, $3}')
+                        log_date_seconds=$(date -d "$log_date_str" +%s 2>/dev/null || echo 0)
+                        if [ "$log_date_seconds" -ge "$start_date_seconds" ] || [[ "$log" == "/var/log/auth.log" ]] || [[ "$log" == "/var/log/secure" ]]; then
+                           process_log_entry "$line" "AUTH" "$MERGED_LOG"
+                        fi
+                    done
+                fi
+            done
+        elif [ "$VERBOSE" -eq 1 ]; then
+             echo -e "  ${YC}Warning: No files found for pattern $log_file_pattern${NC}"
+        fi
+    done
+
+
+    if command -v journalctl >/dev/null; then
+        [ "$VERBOSE" -eq 1 ] && echo -e "  ${BC}Reading from journalctl for sshd (last $DAYS days)${NC}"
+        journalctl _SYSTEMD_UNIT=sshd.service _SYSTEMD_UNIT=ssh.service _SYSTEMD_UNIT=ssh --since "$DAYS days ago" --no-pager --output=short-traditional 2>/dev/null |
+        grep -E "(Accepted|Failed|Invalid user|session opened for user|session closed for user|Disconnecting from|Connection closed by)" |
+        while IFS= read -r line; do process_log_entry "$line" "JOURNAL" "$MERGED_LOG"; done
+    elif [ "$VERBOSE" -eq 1 ]; then
+        echo -e "  ${YC}Warning: journalctl not available${NC}"
+    fi
+
+    if command -v last >/dev/null; then
+        [ "$VERBOSE" -eq 1 ] && echo -e "  ${BC}Reading from wtmp (last command, last $DAYS days)${NC}"
+        last_since_date=$(date -d "$DAYS days ago" "+%Y%m%d%H%M%S")
+        # Use -w for wider username display if available, fallback if not. Not all `last` versions support -w.
+        # For simplicity, we'll stick to default `last -F` for now.
+        last -F -s "$last_since_date" 2>/dev/null | grep -v "wtmp begin\|reboot\|^$" | head -n 1000 |
+        while IFS= read -r line; do
+            local username_last=$(echo "$line" | awk '{print $1}')
+            local ip_last=$(echo "$line" | awk '{print $3}')
+            # process_log_entry will handle date extraction for WTMP source
+            # local raw_date_last=$(echo "$line" | awk '{print $4, $5, $6, $7, $8}')
+            # local date_last=$(normalize_date "$raw_date_last")
+
+            local event_last
+            if echo "$line" | grep -q "still logged in"; then
+                event_last="Active session (wtmp)"
+            elif echo "$line" | grep -q "gone - no logout"; then
+                event_last="Session ended (no logout)"
+            else
+                event_last="Completed session (wtmp)"
+            fi
+
+            username_last=$(fix_truncated_username "$username_last")
+            [ -z "$ip_last" ] || [[ "$ip_last" == "-" ]] && ip_last="unknown"
+            ip_last=$(echo "$ip_last" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' || echo "$ip_last")
+
+            # Pass the raw line to process_log_entry for date parsing
+            local date_from_process=$(process_log_entry_for_wtmp "$line" "WTMP" "$username_last" "$ip_last" "$event_last")
+            if [ -n "$date_from_process" ]; then
+                 echo "$date_from_process|WTMP|$event_last|$username_last|$ip_last|$line" >> "$MERGED_LOG"
+            fi
+        done
+    elif [ "$VERBOSE" -eq 1 ]; then
+        echo -e "  ${YC}Warning: last command not available${NC}"
+    fi
+}
+
+# Helper function for WTMP processing to get date from raw line
+process_log_entry_for_wtmp() {
+    local line="$1" source="$2" username="$3" ip="$4" event="$5" # Not using all, but good to have signature
+    local raw_date_candidate=$(echo "$line" | awk '{print $4, $5, $6, $7, $8}') # Day Mon DD HH:MM:SS YYYY
+    normalize_date "$raw_date_candidate"
+    # This function now just returns the normalized date string
+}
+
+
+# Sort logs by the normalized date (first field)
+sort_logs() {
+    if [ ! -s "$MERGED_LOG" ]; then
+        [ "$VERBOSE" -eq 1 ] && echo -e "  ${YC}No logs collected to sort.${NC}"
+        return
+    fi
+    echo -e "  ${BC}Sorting entries by date...${NC}"
+    sort -t'|' -k1 "$MERGED_LOG" -o "$PROCESSED_LOG" && mv "$PROCESSED_LOG" "$MERGED_LOG"
+}
+
+# Display results
+display_results() {
+    if [ -s "$MERGED_LOG" ]; then
+        printf "${BC}%-20s %-8s %-24s %-20s %-15s${NC}\n" "DATE" "SOURCE" "EVENT" "USERNAME" "IP"
+        printf "${BC}%-20s %-8s %-24s %-20s %-15s${NC}\n" "--------------------" "--------" "------------------------" "--------------------" "---------------"
+
+        while IFS='|' read -r date source event username ip _; do
+            local color=$NC
+            case "$event" in
+                "Login success (pubkey)"|"Login success (passwd)") color=$GC ;;
+                "Login failed (passwd)"|"Login failed (disconn)"|"Login failed (closed)"|"Login failed (inv_user)") color=$RC ;;
+                "Session opened") color=$BC ;;
+                "Session closed"|"Completed session (wtmp)"|"Session ended (no logout)") color=$YC ;;
+                "Active session (wtmp)") color=$CC ;;
+            esac
+            printf "${color}%-20s %-8s %-24s %-20s %-15s${NC}\n" "$date" "$source" "$event" "$username" "$ip"
+        done < "$MERGED_LOG"
+
+        echo -e "\n${BC}===== Summary Statistics =====${NC}"
+        echo -e "${CC}Total SSH events processed:${NC} $(wc -l < "$MERGED_LOG")"
+
+        echo -e "\n${CC}Event Types:${NC}"
+        awk -F'|' '{print $3}' "$MERGED_LOG" | sort | uniq -c | sort -nr |
+        while read -r count event_type; do
+            local color=$NC
+            case "$event_type" in
+                "Login success (pubkey)"|"Login success (passwd)") color=$GC ;;
+                "Login failed (passwd)"|"Login failed (disconn)"|"Login failed (closed)"|"Login failed (inv_user)") color=$RC ;;
+                "Session opened") color=$BC ;;
+                "Session closed"|"Completed session (wtmp)"|"Session ended (no logout)") color=$YC ;;
+                "Active session (wtmp)") color=$CC ;;
+            esac
+            printf "  ${color}%-24s${NC} %4d occurrences\n" "$event_type" "$count"
+        done
+
+        echo -e "\n${CC}User Activity from System Logs (AUTH/JOURNAL - Top 10):${NC}"
+        awk -F'|' '($2 == "AUTH" || $2 == "JOURNAL") && $4 != "unknown" && $4 != "" {print $4}' "$MERGED_LOG" | sort | uniq -c | sort -nr | head -10 |
+        while read -r count user; do
+            printf "  ${GC}%-20s${NC} %4d events\n" "$user" "$count"
+        done
+        
+        echo -e "\n${CC}User Activity from Session Logs (WTMP - Top 10):${NC}"
+        awk -F'|' '$2 == "WTMP" && $4 != "unknown" && $4 != "" {print $4}' "$MERGED_LOG" | sort | uniq -c | sort -nr | head -10 |
+        while read -r count user; do
+            printf "  ${GC}%-20s${NC} %4d events\n" "$user" "$count"
+        done
+
+        echo -e "\n${CC}IP Statistics (Top 10 associated with events):${NC}"
+        awk -F'|' '$5 != "N/A" && $5 != "unknown" && $5 != "" {print $5}' "$MERGED_LOG" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | sort | uniq -c | sort -nr | head -10 |
+        while read -r count ip_addr; do
+            printf "  ${GC}%-15s${NC} %4d events\n" "$ip_addr" "$count"
+        done
+
+        echo -e "\n${BC}===== Security Analysis =====${NC}"
+        failed_count=$(grep -c "|Login failed" "$MERGED_LOG")
+        if [ "$failed_count" -gt 0 ]; then
+            echo -e "${RC}Total Failed Login Attempts:${NC} $failed_count"
+            echo -e "${YC}Recent Failed Attempts (last 5):${NC}"
+            grep "|Login failed" "$MERGED_LOG" | tail -5 |
+            while IFS='|' read -r date_failed _ event_failed username_failed ip_failed _; do
+                printf "  ${RC}%-20s %-20s %-15s (${event_failed})${NC}\n" "$date_failed" "$username_failed" "$ip_failed"
+            done
+
+            echo -e "\n${YC}Top Usernames in Failed Logins (Top 5):${NC}"
+            grep "|Login failed" "$MERGED_LOG" | awk -F'|' '$4 != "unknown" && $4 != "" {print $4}' | sort | uniq -c | sort -nr | head -5 |
+            while read -r count user; do
+                printf "  ${RC}%-20s${NC} %4d attempts\n" "$user" "$count"
+            done
+
+            echo -e "\n${YC}Top IPs in Failed Logins (Top 5):${NC}"
+            grep "|Login failed" "$MERGED_LOG" | awk -F'|' '$5 != "unknown" && $5 != "N/A" && $5 != "" {print $5}' | grep -E '([0-9]{1,3}\.){3}[0-9]{1,3}' | sort | uniq -c | sort -nr | head -5 |
+            while read -r count ip_addr; do
+                printf "  ${RC}%-15s${NC} %4d attempts\n" "$ip_addr" "$count"
+            done
+        else
+            echo -e "${GC}No failed login attempts detected in the processed logs.${NC}"
+        fi
+    else
+        echo -e "${RC}No SSH activity found or processed in the last $DAYS days.${NC}"
+    fi
+}
+
+# Real-time monitoring
+monitor_logs() {
+    if [ $FOLLOW_MODE -eq 1 ]; then
+        echo -e "\n${BC}===== Real-time Monitoring (Ctrl+C to exit) =====${NC}"
+        printf "${BC}%-20s %-8s %-24s %-20s %-15s${NC}\n" "DATE" "SOURCE" "EVENT" "USERNAME" "IP"
+        printf "${BC}%-20s %-8s %-24s %-20s %-15s${NC}\n" "--------------------" "--------" "------------------------" "--------------------" "---------------"
+
+        LOG_TO_MONITOR=""
+        if [ -f /var/log/auth.log ]; then
+            LOG_TO_MONITOR="/var/log/auth.log"
+        elif [ -f /var/log/secure ]; then
+            LOG_TO_MONITOR="/var/log/secure"
+        else
+            echo -e "${RC}Error: Cannot find a suitable log file for real-time monitoring (/var/log/auth.log or /var/log/secure).${NC}"
+            # Do not exit if outputting to file, allow analysis to complete.
+            if [ -z "$OUTPUT_FILE" ]; then exit 1; else return; fi
+        fi
+        
+        [ "$VERBOSE" -eq 1 ] && echo -e "  ${CC}Monitoring: $LOG_TO_MONITOR ${NC}"
+
+        tail -F "$LOG_TO_MONITOR" 2>/dev/null |
+        grep --line-buffered -E "sshd\[[0-9]+\]: (Accepted|Failed|Invalid user|session opened for user|session closed for user|Disconnecting from|Connection closed by)" |
+        while IFS= read -r line; do
+            local raw_date_candidate=$(echo "$line" | awk '{print $1, $2, $3}')
+            local date=$(normalize_date "$raw_date_candidate")
+            local event username ip color=$NC
+
+            if echo "$line" | grep -q "Accepted publickey for"; then event="Login success (pubkey)"; color=$GC;
+            elif echo "$line" | grep -q "Accepted password for"; then event="Login success (passwd)"; color=$GC;
+            elif echo "$line" | grep -q "Failed password for"; then event="Login failed (passwd)"; color=$RC;
+            elif echo "$line" | grep -q "Disconnecting from authenticating user"; then event="Login failed (disconn)"; color=$RC;
+            elif echo "$line" | grep -q "Connection closed by authenticating user"; then event="Login failed (closed)"; color=$RC;
+            elif echo "$line" | grep -q "Invalid user"; then event="Login failed (inv_user)"; color=$RC;
+            elif echo "$line" | grep -q "pam_unix(sshd:session): session opened for user"; then event="Session opened"; color=$BC;
+            elif echo "$line" | grep -q "pam_unix(sshd:session): session closed for user"; then event="Session closed"; color=$YC;
+            else event="Other SSH event"; fi
+
+            if [[ "$event" != "Other SSH event" ]]; then
+                 if [[ "$event" == "Session opened" || "$event" == "Session closed" ]]; then
+                    username=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i=="user") print $(i+1)}')
+                    username=$(echo "$username" | sed 's/(uid=.*//')
+                    ip="N/A"
+                 elif [[ "$event" =~ "Login failed" ]]; then
+                    if echo "$line" | grep -q "invalid user"; then
+                         username=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i=="user") print $(i+1)}')
+                    else
+                         username=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i=="for") print $(i+1)}')
+                    fi
+                    ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i=="from") print $(i+1)}')
+                    if [[ -z "$ip" && ("$event" == "Login failed (disconn)" || "$event" == "Login failed (closed)") ]]; then
+                        ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i=="port") print $(i-1)}')
+                    fi
+                 else # Login success
+                    username=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i=="for") print $(i+1)}')
+                    ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i=="from") print $(i+1)}')
+                 fi
+                username=$(fix_truncated_username "$username")
+                [ -z "$ip" ] && ip="unknown"
+                ip=$(echo "$ip" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' || echo "$ip")
+
+                printf "${color}%-20s %-8s %-24s %-20s %-15s${NC}\n" "$date" "LIVE" "$event" "$username" "$ip"
+            elif [ "$VERBOSE" -eq 1 ]; then
+                 echo -e "  ${YC}Skipped live line: $line${NC}"
+            fi
+        done
+    else
+        echo -e "\n${BC}===== Analysis Complete =====${NC}"
+        if [ -z "$OUTPUT_FILE" ]; then
+            echo -e "${YC}Use -f or --follow for real-time monitoring. Output was not saved to a file.${NC}"
+        else
+            echo -e "${YC}Use -f or --follow for real-time monitoring. Output saved to: $OUTPUT_FILE${NC}"
+        fi
+    fi
+}
+
+# Main execution flow
+collect_logs
+sort_logs
+display_results
+monitor_logs
+
+exit 0
