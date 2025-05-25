@@ -1,0 +1,143 @@
+#!/bin/bash
+
+# Check if we have sudo access
+if sudo -n true 2>/dev/null; then
+    HAVE_SUDO=1
+else
+    HAVE_SUDO=0
+fi
+
+# Process users with login shells
+while IFS=: read -r username _ uid _ _ home shell; do
+    # Skip invalid shells
+    if ! echo "$shell" | grep -q "/bin/.*sh"; then
+        continue
+    fi
+
+    # Get group information
+    if ! groups_list=$(id -Gn "$username" 2>/dev/null); then
+        continue
+    fi
+    [ -z "$groups_list" ] && continue
+
+    # Get password lock status from /etc/shadow
+    if [ "$HAVE_SUDO" -eq 1 ]; then
+        shadow_entry=$(sudo grep "^$username:" /etc/shadow 2>/dev/null)
+        if [ -n "$shadow_entry" ]; then
+            pw_field=$(echo "$shadow_entry" | cut -d: -f2)
+            if echo "$pw_field" | grep -q "^!"; then
+                pw_info="pass:0"
+            elif [ "$pw_field" = "*" ]; then
+                pw_info="pass:*"
+            elif [ -n "$pw_field" ] && [ "$pw_field" != "!" ]; then
+                pw_info="pass:1"
+            else
+                pw_info="pass:?"
+            fi
+        else
+            pw_info="pass:."
+        fi
+    else
+        # Non-sudo: only check current user
+        if [ "$username" = "$(whoami)" ]; then
+            shadow_entry=$(sudo grep "^$username:" /etc/shadow 2>/dev/null || true)
+            if [ -n "$shadow_entry" ]; then
+                pw_field=$(echo "$shadow_entry" | cut -d: -f2)
+                if echo "$pw_field" | grep -q "^!"; then
+                    pw_info="pass:0"
+                elif [ "$pw_field" = "*" ]; then
+                    pw_info="pass:*"
+                elif [ -n "$pw_field" ] && [ "$pw_field" != "!" ]; then
+                    pw_info="pass:1"
+                else
+                    pw_info="pass:?"
+                fi
+            else
+                pw_info="pass:."
+            fi
+        else
+            pw_info="pass:."
+        fi
+    fi
+
+    # Check for SSH keys
+    ssh_dir="$home/.ssh"
+    auth_keys="$ssh_dir/authorized_keys"
+    key_count=0
+
+    if [ "$HAVE_SUDO" -eq 1 ] || [ "$username" = "$(whoami)" ]; then
+        if [ "$HAVE_SUDO" -eq 1 ]; then
+            if sudo -n test -f "$auth_keys"; then
+                key_count=$(sudo -n cat "$auth_keys" 2>/dev/null | grep -c "^ssh-.*" | tr -d '\n')
+                [ -z "$key_count" ] && key_count=0
+            fi
+            if sudo -n test -f "$ssh_dir/authorized_keys2"; then
+                additional_keys=$(sudo -n cat "$ssh_dir/authorized_keys2" 2>/dev/null | grep -c "^ssh-.*" | tr -d '\n')
+                [ -z "$additional_keys" ] && additional_keys=0
+                key_count=$((key_count + additional_keys))
+            fi
+        else
+            if [ -f "$auth_keys" ]; then
+                key_count=$(grep -c "^ssh-.*" "$auth_keys" 2>/dev/null | tr -d '\n')
+                [ -z "$key_count" ] && key_count=0
+            fi
+            if [ -f "$ssh_dir/authorized_keys2" ]; then
+                additional_keys=$(grep -c "^ssh-.*" "$ssh_dir/authorized_keys2" 2>/dev/null | tr -d '\n')
+                [ -z "$additional_keys" ] && additional_keys=0
+                key_count=$((key_count + additional_keys))
+            fi
+        fi
+        key_info="keys:$key_count"
+    else
+        key_info="keys:."
+    fi
+
+    # Check if user has sudo privileges
+    if [ "$HAVE_SUDO" -eq 1 ]; then
+        # Check /etc/sudoers and /etc/sudoers.d/* for user or group entries
+        sudoers_check=$(sudo cat /etc/sudoers /etc/sudoers.d/* 2>/dev/null | grep -v "^#" | grep -v "^$" | grep -E "^$username|%[^ ]+")
+        if [ -n "$sudoers_check" ]; then
+            # Check if username is directly mentioned
+            if echo "$sudoers_check" | grep -q "^$username"; then
+                sudo_info="sudo:1"
+            else
+                # Check if any of user's groups are in sudoers
+                sudo_info="sudo:0"
+                for group in $groups_list; do
+                    if echo "$sudoers_check" | grep -q "%$group"; then
+                        sudo_info="sudo:1"
+                        break
+                    fi
+                done
+            fi
+        else
+            sudo_info="sudo:0"
+        fi
+    else
+        sudo_info="sudo:."
+    fi
+
+    # Filter and format output with colors and alignment
+    if [ "$pw_info" = "pass:1" ] || [ "$key_info" != "keys:0" ] || [ "$shell" != "/bin/bash" ]; then
+        clean_groups=$(echo "$groups_list" | tr -s ' ' | sed 's/^ *//;s/ *$//')
+        shell_formatted=$(printf "%-10.10s" "$shell")
+
+        # Use \033 and %b for color codes
+        if [ "$pw_info" = "pass:1" ]; then
+            pw_info="\033[31m$pw_info\033[0m"
+        fi
+        if echo "$key_info" | grep -q "keys:[1-9]"; then
+            key_info="\033[32m$key_info\033[0m"
+        fi
+        if [ "$shell" != "/bin/bash" ]; then
+            shell_formatted="\033[33m$shell_formatted\033[0m"
+        fi
+        if [ "$sudo_info" = "sudo:1" ]; then
+            sudo_info="\033[34m$sudo_info\033[0m"  # Blue for sudo:1
+        fi
+
+        # Add sudo_info to output
+        printf "%25s\t%b\t%b\t%b\t%b\t%s\n" "$username" "$pw_info" "$key_info" "$shell_formatted" "$sudo_info" "$clean_groups"
+    fi
+done < <(getent passwd | sort)
+
