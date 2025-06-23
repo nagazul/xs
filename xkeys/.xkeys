@@ -1,5 +1,6 @@
 #!/bin/bash
 # Enhanced SSH Agent Management with Multi-Key Support
+# Compatible with both bash and zsh
 # dependencies: ssh-agent, ssh-add, openssl, chmod, ps, grep, awk, kill, expect
 
 # Guard against multiple full loads
@@ -48,24 +49,55 @@ fi
 MASTER_PASSWORD_CACHE=""
 
 #
-# Initialization
+# Shell Detection and Compatibility
 #
 
-# Track temporary files for cleanup
-declare -a TEMP_FILES
+# Detect shell and set compatibility flags
+if [ -n "$ZSH_VERSION" ]; then
+    SHELL_TYPE="zsh"
+    # Enable bash-style arrays in zsh
+    setopt KSH_ARRAYS 2>/dev/null || true
+    setopt SH_WORD_SPLIT 2>/dev/null || true
+else
+    SHELL_TYPE="bash"
+fi
+
+# Cross-shell array initialization
+if [ "$SHELL_TYPE" = "zsh" ]; then
+    # ZSH array declaration
+    typeset -a TEMP_FILES
+    TEMP_FILES=()
+else
+    # Bash array declaration
+    declare -a TEMP_FILES
+fi
+
+#
+# Initialization
+#
 
 # Logging function
 log_debug() {
     [ "$DEBUG_MODE" -eq 1 ] && printf "${GY}[DEBUG] $1${NC}\n"
 }
-export -f log_debug
+# Note: In zsh, functions are automatically available to subshells
+# In bash, we could export with 'export -f' but it's not necessary for this use case
 
 # Cleanup functions
 cleanup_temp_files() {
-    for tmp_file in "${TEMP_FILES[@]}"; do
-        safe_delete_temp_file "$tmp_file"
-        log_debug "Deleted temporary file: $tmp_file"
-    done
+    local i
+    if [ "$SHELL_TYPE" = "zsh" ]; then
+        # ZSH array iteration
+        for i in "${TEMP_FILES[@]}"; do
+            [ -n "$i" ] && safe_delete_temp_file "$i" && log_debug "Deleted temporary file: $i"
+        done
+    else
+        # Bash array iteration
+        for i in "${TEMP_FILES[@]}"; do
+            safe_delete_temp_file "$i"
+            log_debug "Deleted temporary file: $i"
+        done
+    fi
 }
 
 cleanup_master_password() {
@@ -73,9 +105,9 @@ cleanup_master_password() {
     log_debug "Master password cache cleared."
 }
 
-# Register cleanup handlers
-trap cleanup_temp_files EXIT INT TERM
-trap cleanup_master_password EXIT INT TERM
+# Register cleanup handlers (removed INT as it brakes zsh)
+trap cleanup_temp_files EXIT TERM
+trap cleanup_master_password EXIT TERM
 
 # Create and secure directories
 mkdir -p "$TMP_DIR" "$KEYS_DIR" "$KEYS_ENC"
@@ -97,9 +129,26 @@ safe_delete() {
    [ ! -d "$file" ] || return 1                  # Not a directory
    [ -w "$(dirname "$file")" ] || return 1       # Parent dir writable
 
-   # Pattern and permissions checks
-   [ -n "$pattern" ] && [[ ! "$file" =~ $pattern ]] && return 1
-   [ -n "$perms" ] && [ ! -h "$file" ] && [[ ! "$(stat -L -c "%a" "$file")" =~ ^($perms)$ ]] && return 1
+   # Pattern and permissions checks (cross-shell regex)
+   if [ -n "$pattern" ]; then
+       case "$file" in
+           *) if [ "$SHELL_TYPE" = "zsh" ]; then
+                  [[ "$file" =~ "$pattern" ]] || return 1
+              else
+                  [[ "$file" =~ $pattern ]] || return 1
+              fi
+              ;;
+       esac
+   fi
+   
+   if [ -n "$perms" ] && [ ! -h "$file" ]; then
+       local file_perms
+       file_perms=$(stat -L -c "%a" "$file")
+       case "$file_perms" in
+           $perms) ;;
+           *) return 1 ;;
+       esac
+   fi
 
    if [ -h "$file" ]; then                       # Handle symlinks
        unlink "$file"
@@ -127,7 +176,13 @@ safe_delete_dir() {
    [ -O "$dir" ] || return 1                     # Must be owner
    [ ! -h "$dir" ] || return 1                   # Not a symlink
    [ -w "$(dirname "$dir")" ] || return 1        # Parent dir writable
-   [[ "$dir" =~ $pattern ]] || return 1          # Must match pattern
+   
+   # Cross-shell regex matching
+   if [ "$SHELL_TYPE" = "zsh" ]; then
+       [[ "$dir" =~ "$pattern" ]] || return 1
+   else
+       [[ "$dir" =~ $pattern ]] || return 1
+   fi
 
    # Find and securely delete all files first
    find "$dir" -type f -exec sh -c '
@@ -211,7 +266,13 @@ secure_copy() {
     # Create temporary file with secure permissions
     temp_file=$(mktemp)
     chmod 600 "$temp_file"
-    TEMP_FILES+=("$temp_file")
+    
+    # Cross-shell array append
+    if [ "$SHELL_TYPE" = "zsh" ]; then
+        TEMP_FILES+=("$temp_file")
+    else
+        TEMP_FILES+=("$temp_file")
+    fi
 
     # Copy with atomic operation
     cp -p "$src" "$temp_file" &&
@@ -227,7 +288,7 @@ check_ssh_agent() {
     if [ -f "$AGENT_ENV" ]; then
         . "$AGENT_ENV" >/dev/null 2>&1
 
-        if [ -n "$SSH_AGENT_PID" ] && [[ "$SSH_AGENT_PID" =~ ^[0-9]+$ ]] && ps -p "$SSH_AGENT_PID" >/dev/null 2>&1; then
+        if [ -n "$SSH_AGENT_PID" ] && case "$SSH_AGENT_PID" in ''|*[!0-9]*) false;; *) true;; esac && ps -p "$SSH_AGENT_PID" >/dev/null 2>&1; then
             if [ -n "$SSH_AUTH_SOCK" ] && [ -S "$SSH_AUTH_SOCK" ]; then
                 if ssh-add -l >/dev/null 2>&1 || [ $? -eq 1 ]; then
                     return 0
@@ -358,7 +419,14 @@ add_key_to_agent() {
         printf "${RC}Error: Failed to create temp file${NC}\n"
         return 1
     }
-    TEMP_FILES+=("$tmpfile")
+    
+    # Cross-shell array append
+    if [ "$SHELL_TYPE" = "zsh" ]; then
+        TEMP_FILES+=("$tmpfile")
+    else
+        TEMP_FILES+=("$tmpfile")
+    fi
+    
     log_debug "Created temporary expect script: $tmpfile"
 
     # Create expect script with proper variable escaping and error handling
@@ -498,20 +566,20 @@ _xkeys_clean() {
         if ! ps -p "$SSH_AGENT_PID" >/dev/null 2>&1 || [ "$force" = "--force" ]; then
             safe_delete_agent_file "$AGENT_ENV" && {
                 printf "${GC}Removed stale agent environment file${NC}\n"
-                ((cleaned++))
+                cleaned=$((cleaned + 1))
             }
         fi
-        ((total++))
+        total=$((total + 1))
     fi
 
     # Clean up runtime directory
     if [ -d "$TMP_DIR" ]; then
         find "$TMP_DIR" -maxdepth 1 -type s -name "agent.*" | while read -r socket; do
-            ((total++))
+            total=$((total + 1))
             if [ ! -S "$socket" ] || ! lsof "$socket" >/dev/null 2>&1 || [ "$force" = "--force" ]; then
                 if safe_delete "$socket" "$TMP_PATTERN" "600"; then
                     printf "${GC}Removed socket: %s${NC}\n" "$socket"
-                    ((cleaned++))
+                    cleaned=$((cleaned + 1))
                 fi
             fi
         done
@@ -520,7 +588,7 @@ _xkeys_clean() {
     # Clean up orphaned passphrase files
     if [ -d "$KEYS_ENC" ]; then
         find "$KEYS_ENC" -type f -name "*.enc" | while read -r pfile; do
-            ((total++))
+            total=$((total + 1))
             local found=0
             for key_link in "$KEYS_DIR"/*; do
                 [ -L "$key_link" ] || continue
@@ -533,7 +601,7 @@ _xkeys_clean() {
             if [ "$found" -eq 0 ] || [ "$force" = "--force" ]; then
                 if safe_delete_passphrase "$pfile"; then
                     printf "${GC}Removed orphaned passphrase file: %s${NC}\n" "$pfile"
-                    ((cleaned++))
+                    cleaned=$((cleaned + 1))
                 fi
             fi
         done
@@ -779,7 +847,7 @@ _xkeys_verify_keys() {
         }
 
         if ssh-keygen -y -f "$key_path" -P "$decrypted_passphrase" >/dev/null 2>&1; then
-            ((success++))
+            success=$((success + 1))
             printf "${GC}Verified: %s${NC}\n" "$key_path"
         else
             printf "${RC}ERROR: Invalid passphrase for: %s${NC}\n" "$key_path"
@@ -860,7 +928,7 @@ _xkeys_load_all_keys() {
     # Now load all keys
     for key_link in "$KEYS_DIR"/*; do
         [ -L "$key_link" ] || continue
-        ((total++))
+        total=$((total + 1))
         local key_path=$(readlink -f "$key_link")
         log_debug "LOAD_ALL_KEYS (main loop): Processing key $key_path."
 
@@ -889,7 +957,7 @@ _xkeys_load_all_keys() {
         fi
 
         if [ "$key_found_in_agent" -eq 1 ]; then
-            ((success++))
+            success=$((success + 1))
             printf "${GC}Key already loaded: %s${NC}\n" "$key_path"
             log_debug "LOAD_ALL_KEYS (main loop): Key $key_path (fingerprint $key_fingerprint) reported as 'already loaded'."
             continue
@@ -987,7 +1055,7 @@ _xkeys_change_master_password() {
 
     for passphrase_file in "$KEYS_ENC"/*.enc; do
         [ -f "$passphrase_file" ] || continue
-        ((total++))
+        total=$((total + 1))
 
         # Decrypt and immediately re-encrypt without temp files
         decrypted_passphrase=$(openssl enc -d -aes-256-cbc -pbkdf2 -iter 10000 -md sha256 -k "$old_kek" -in "$passphrase_file" 2>/dev/null) || continue
@@ -1000,7 +1068,7 @@ _xkeys_change_master_password() {
 
         chmod 400 "$new_file"
         if mv "$new_file" "$passphrase_file"; then
-            ((success++))
+            success=$((success + 1))
         else
             safe_delete "$new_file"
         fi
@@ -1034,7 +1102,7 @@ _xkeys_test() {
     local key_count=0
     for key_link in "$KEYS_DIR"/*; do
         [ -L "$key_link" ] || continue
-        ((key_count++))
+        key_count=$((key_count + 1))
         local key_path=$(readlink -f "$key_link")
         local passphrase_file="$KEYS_ENC/$(key_checksum "$key_path").enc"
 
@@ -1087,11 +1155,11 @@ _xkeys_test() {
             local passphrase_file="$KEYS_ENC/$(key_checksum "$key_path").enc"
 
             [ -f "$passphrase_file" ] || continue
-            ((test_total++))
+            test_total=$((test_total + 1))
 
             local kek=$(derive_kek "$test_password")
             if openssl enc -d -aes-256-cbc -pbkdf2 -iter 10000 -md sha256 -k "$kek" -in "$passphrase_file" >/dev/null 2>&1; then
-                ((test_success++))
+                test_success=$((test_success + 1))
                 printf "  ${GC}✓ Successfully decrypted passphrase for: %s${NC}\n" "$(basename "$key_path")"
             else
                 printf "  ${RC}✗ Failed to decrypt passphrase for: %s${NC}\n" "$(basename "$key_path")"
@@ -1132,11 +1200,11 @@ _xkeys_add() {
     fi
 
     # Check if key is already registered (and points to the same file)
-    if [[ -L "$target_link" && "$(readlink -f "$target_link")" == "$sanitized_path" ]]; then
+    if [ -L "$target_link" ] && [ "$(readlink -f "$target_link")" = "$sanitized_path" ]; then
         printf "${GY}Key '%s' is already registered.${NC}\n" "$sanitized_path"
 
         # If passphrase exists, try to load the key
-        if [[ -f "$passphrase_file" ]]; then
+        if [ -f "$passphrase_file" ]; then
             if ! check_ssh_agent; then
                 init_ssh_agent || return 1
             fi
@@ -1187,7 +1255,7 @@ _xkeys_add() {
         return 1
     }
     # Only print "registered" if it wasn't already printed, or to confirm link update
-    if ! printf "%s" "${target_link_existed_before}" | grep -q "true" || [ "$(readlink -f "$target_link")" != "$sanitized_path" ]; then
+    if ! printf "%s" "${target_link_existed_before:-false}" | grep -q "true" || [ "$(readlink -f "$target_link")" != "$sanitized_path" ]; then
         printf "${GC}Key '%s' registered (symlink created/updated).${NC}\n" "$sanitized_path"
     fi
 
@@ -1230,7 +1298,7 @@ _xkeys_add() {
         init_ssh_agent || return 1
     fi
 
-    if [[ -n "$ssh_passphrase" ]]; then
+    if [ -n "$ssh_passphrase" ]; then
         add_key_to_agent "$sanitized_path" "$ssh_passphrase" && {
             printf "${GC}Successfully loaded key into agent.${NC}\n"
         }
@@ -1256,7 +1324,7 @@ _xkeys_remove() {
     local passphrase_file="$KEYS_ENC/$(key_checksum "$sanitized_path").enc"
 
     # Verify key is registered
-    [[ -L "$key_link" ]] && [[ "$(realpath "$key_link")" == "$sanitized_path" ]] || {
+    [ -L "$key_link" ] && [ "$(realpath "$key_link")" = "$sanitized_path" ] || {
         printf "${RC}Error: Key not registered: %s${NC}\n" "$sanitized_path"
         return 1
     }
@@ -1268,7 +1336,7 @@ _xkeys_remove() {
 
     # Remove symlink and passphrase atomically
     safe_delete "$key_link"
-    [[ -f "$passphrase_file" ]] && safe_delete_passphrase "$passphrase_file"
+    [ -f "$passphrase_file" ] && safe_delete_passphrase "$passphrase_file"
 
     printf "${GC}Key removed: %s${NC}\n" "$sanitized_path"
 }
@@ -1283,14 +1351,14 @@ xkeys() {
 
     case "$1" in
         add)
-            [[ -z "$2" ]] && {
+            [ -z "$2" ] && {
                 printf "${RC}Error: Please specify a key path${NC}\n"
                 return 1
             }
             _xkeys_add "$2"
             ;;
         rm)
-            [[ -z "$2" ]] && {
+            [ -z "$2" ] && {
                 printf "${RC}Error: Please specify a key path${NC}\n"
                 return 1
             }
@@ -1362,60 +1430,95 @@ EOF
     esac
 }
 
-# Command completion function
+# Command completion function (cross-shell compatible)
 _xkeys_complete() {
     local cur prev commands
-    COMPREPLY=()
-    cur="${COMP_WORDS[COMP_CWORD]}"
-    prev="${COMP_WORDS[COMP_CWORD-1]}"
-    commands="ls scan add rm load verify passwd kill clean purge test"
+    
+    if [ "$SHELL_TYPE" = "zsh" ]; then
+        # ZSH completion setup
+        local state line
+        typeset -A opt_args
+        
+        case $state in
+            commands)
+                _values 'xkeys commands' \
+                    'ls[Show SSH agent and registered keys status]' \
+                    'scan[Scan for SSH keys in directory]' \
+                    'add[Add key to xkeys management and load]' \
+                    'rm[Remove key from xkeys]' \
+                    'load[Load registered keys into agent]' \
+                    'kill[Stop agent and unload keys]' \
+                    'clean[Clean up temporary files]' \
+                    'purge[Remove all xkeys data]' \
+                    'verify[Verify keys integrity]' \
+                    'passwd[Change master password]' \
+                    'test[Test xkeys configuration]'
+                ;;
+        esac
+        return 0
+    else
+        # Bash completion
+        COMPREPLY=()
+        cur="${COMP_WORDS[COMP_CWORD]}"
+        prev="${COMP_WORDS[COMP_CWORD-1]}"
+        commands="ls scan add rm load verify passwd kill clean purge test"
 
-    case "${prev}" in
-        "xkeys")
-            # Complete command names
-            COMPREPLY=( $(compgen -W "${commands}" -- ${cur}) )
-            ;;
-        "add")
-           # Find SSH private key files and exclude .pub
-           local key_pattern='id_*'
-           if [ -d "$SSH_DIR" ]; then
-               local keys=()
-               while IFS= read -r key; do
-                   if grep -q "PRIVATE KEY" "$key" 2>/dev/null; then
-                       keys+=("$key")
-                   fi
-               done < <(find "$SSH_DIR" -type f -name "$key_pattern")
-               COMPREPLY=($(compgen -W "${keys[*]}" -- "${cur}"))
-           fi
-           ;;
-        "rm")
-            if [ -d "$KEYS_DIR" ]; then
-                local registered_keys=()
-                while IFS= read -r link; do
-                    if [ -L "$link" ]; then
-                        registered_keys+=("$(readlink -f "$link")")
-                    fi
-                done < <(find "$KEYS_DIR" -type l)
-                COMPREPLY=($(compgen -W "${registered_keys[*]}" -- "${cur}"))
-            fi
-            ;;
-        "scan"|"purge")
-            # Complete with directory paths
-            COMPREPLY=( $(compgen -d -- ${cur}) )
-            ;;
-        *)
-            COMPREPLY=()
-            ;;
-    esac
-
-    return 0
+        case "${prev}" in
+            "xkeys")
+                # Complete command names
+                COMPREPLY=( $(compgen -W "${commands}" -- ${cur}) )
+                ;;
+            "add")
+               # Find SSH private key files and exclude .pub
+               local key_pattern='id_*'
+               if [ -d "$SSH_DIR" ]; then
+                   local keys=()
+                   while IFS= read -r key; do
+                       if grep -q "PRIVATE KEY" "$key" 2>/dev/null; then
+                           keys+=("$key")
+                       fi
+                   done < <(find "$SSH_DIR" -type f -name "$key_pattern")
+                   COMPREPLY=($(compgen -W "${keys[*]}" -- "${cur}"))
+               fi
+               ;;
+            "rm")
+                if [ -d "$KEYS_DIR" ]; then
+                    local registered_keys=()
+                    while IFS= read -r link; do
+                        if [ -L "$link" ]; then
+                            registered_keys+=("$(readlink -f "$link")")
+                        fi
+                    done < <(find "$KEYS_DIR" -type l)
+                    COMPREPLY=($(compgen -W "${registered_keys[*]}" -- "${cur}"))
+                fi
+                ;;
+            "scan"|"purge")
+                # Complete with directory paths
+                COMPREPLY=( $(compgen -d -- ${cur}) )
+                ;;
+            *)
+                COMPREPLY=()
+                ;;
+        esac
+        return 0
+    fi
 }
 
-# Register completion function
-complete -F _xkeys_complete xkeys
+# Register completion function based on shell type
+if [ "$SHELL_TYPE" = "zsh" ]; then
+    # ZSH completion registration
+    if command -v compdef >/dev/null 2>&1; then
+        compdef _xkeys_complete xkeys
+    fi
+else
+    # Bash completion registration
+    if command -v complete >/dev/null 2>&1; then
+        complete -F _xkeys_complete xkeys
+    fi
+fi
 
 # When sourced, check and use existing agent if available
 check_ssh_agent
 
-# Export necessary functions
-export -f xkeys
+# Note: Functions are automatically available in both bash and zsh when sourced
+# No explicit export needed - export -f is bash-specific and not supported in zsh
