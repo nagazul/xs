@@ -6,7 +6,7 @@ set -euo pipefail
 
 # --- Configuration & Internal Variables ---
 # AI: Increment patch version for subsequent modifications.
-XRUN_VERSION="0.3.46" # Incremented patch version
+XRUN_VERSION="0.3.47" # Incremented patch version to reflect changes
 
 # --- Color Definitions ---
 CN='\033[0m'    # Reset/None
@@ -62,28 +62,28 @@ print_usage() {
     echo "xrun v${XRUN_VERSION}: Advanced SSH Host Runner & Command/Script Executor" >&2
     echo "" >&2
     echo "Usage: $scr_name [options] <host_specs> [remote_command_and_args...]" >&2
-    echo "   or: cat ./script.sh | $scr_name [options] <host_specs>" >&2
-    echo "   or: $scr_name [options] <host_specs> < ./script.sh" >&2
+    echo "   or: cat ./script.sh | $scr_name [options] <host_specs> [script_args...]" >&2
+    echo "   or: $scr_name [options] <host_specs> < ./script.sh [script_args...]" >&2
     echo "   or: $scr_name <host_specs> # List matching hosts" >&2
-    echo "   or: $scr_name              # List all hosts from $SSH_CFG" >&2
+    echo "   or: $scr_name             # List all hosts from $SSH_CFG" >&2
     echo "" >&2
     echo "Options:" >&2
-    echo "  -h, --help          - Show this help message and exit." >&2
-    echo "  -v, --version       - Show version information and exit." >&2
-    echo "  -s, --sudo          - Prepend sudo to the remote command/script." >&2
+    echo "  -h, --help        - Show this help message and exit." >&2
+    echo "  -v, --version     - Show version information and exit." >&2
+    echo "  -s, --sudo        - Prepend sudo to the remote command/script." >&2
     echo "" >&2
     echo "<host_specs> examples (comma-separated for OR, colon within @[] for AND):" >&2
-    echo "  h1,h2               - Specific hosts h1 OR h2." >&2
-    echo "  user@h1             - Specific user on host h1." >&2
-    echo "  @[prod]             - Hosts from $SSH_CFG matching prod." >&2
-    echo "  @[prod:web]         - Hosts matching prod AND web." >&2
-    echo "  @[dev,-test]        - Hosts matching dev AND NOT test." >&2
-    echo "  @[tier1,tier2]      - Hosts matching tier1 OR tier2." >&2
+    echo "  h1,h2             - Specific hosts h1 OR h2." >&2
+    echo "  user@h1           - Specific user on host h1." >&2
+    echo "  @[prod]           - Hosts from $SSH_CFG matching prod." >&2
+    echo "  @[prod:web]       - Hosts matching prod AND web." >&2
+    echo "  @[dev,-test]      - Hosts matching dev AND NOT test." >&2
+    echo "  @[tier1,tier2]    - Hosts matching tier1 OR tier2." >&2
     echo "  @[prod:db,-replica] - Hosts matching prod AND db AND NOT replica." >&2
-    echo "  user@@[p,s]         - user on hosts matching p OR s." >&2
-    echo "  user@@[p:s]         - user on hosts matching p AND s." >&2
+    echo "  user@@[p,s]       - user on hosts matching p OR s." >&2
+    echo "  user@@[p:s]       - user on hosts matching p AND s." >&2
     echo "  h1,@[grpA],user@h2  - Mix: h1 OR hosts in grpA OR user@h2." >&2
-    echo "  @[*] or (none)      - All hosts from $SSH_CFG." >&2
+    echo "  @[*] or (none)    - All hosts from $SSH_CFG." >&2
     echo "" >&2
     echo "Execution Examples:" >&2
     echo "  List hosts:" >&2
@@ -92,8 +92,8 @@ print_usage() {
     echo "  Run command:" >&2
     echo "    $scr_name @[app] hostname -f" >&2
     echo "    $scr_name -s @[staging] apt update && apt upgrade -y" >&2
-    echo "  Run local script via redirect:" >&2
-    echo "    $scr_name @[all] < ./deploy_app.sh" >&2
+    echo "  Run local script via redirect with arguments:" >&2
+    echo "    $scr_name @[all] < ./deploy_app.sh arg1 'arg 2'" >&2
     echo "  Run local script via pipe:" >&2
     echo "    cat ./check_services.sh | $scr_name -s @[prod]" >&2
     echo "" >&2
@@ -168,7 +168,7 @@ proc_filter() {
         local cache_output
         cache_output=$(get_all_hosts_cfg)
         get_hosts_ret=$? # Status of get_all_hosts_cfg
-        
+
         _dbg "proc_filter: get_all_hosts_cfg ret $get_hosts_ret. Output: '$cache_output'"
 
         if [[ "$get_hosts_ret" -ne 0 ]]; then
@@ -177,9 +177,9 @@ proc_filter() {
              _dbg "proc_filter: get_all_hosts_cfg failed. ALL_HOSTS_CACHE will be empty."
              ALL_HOSTS_CACHE="" # Ensure it's empty
         else
-            ALL_HOSTS_CACHE="$cache_output"
+             ALL_HOSTS_CACHE="$cache_output"
         fi
-        
+
         if [[ -z "$ALL_HOSTS_CACHE" && "$list_only_mode" != "list_hosts" && "$get_hosts_ret" -eq 0 ]]; then
              # This condition means get_all_hosts_cfg succeeded but found no hosts.
             echo -e "${CY}Warn: No host definitions found in $SSH_CFG to filter.${CN}" >&2
@@ -251,7 +251,7 @@ proc_filter() {
                 done
             done <<< "$base_list"
         else or_match_hosts_nl="$base_list"$'\n'; fi
-        
+
         local current_processing_list="${or_match_hosts_nl%$'\n'}"
         if [[ ${#excl_pats[@]} -gt 0 && -n "$current_processing_list" ]]; then
             local final_hosts_nl=""
@@ -354,7 +354,8 @@ _run_task_remote() {
         "${ssh_arr[@]}" "${sudo_prefix}${task_str}" > "$out_f" 2> "$err_f"
         ret_code=$?
     elif [ "$ex_mode" = "pipe_script" ]; then
-        # Ensure task_str is passed correctly, especially if it contains newlines
+        # The task_str now contains the script content, potentially with a `set --` line.
+        # The remote command simply needs to execute this content via bash.
         printf '%s' "$task_str" | "${ssh_arr[@]}" "${sudo_prefix}bash -s" > "$out_f" 2> "$err_f"
         ret_code=$?
     else
@@ -475,12 +476,12 @@ exec_parallel() {
             _dbg "'wait -n' seq done. wait_ret: $wait_ret. PID: '$comp_pid'"
 
             if [ -z "$comp_pid" ]; then
-                if [ "$wait_ret" -eq 127 ]; then 
+                if [ "$wait_ret" -eq 127 ]; then
                     _dbg "'wait -n' no children (ret 127). Check tracked PIDs: ${!pid_host_map[*]}"
                     if [ "${#pid_host_map[@]}" -gt 0 ]; then
                         for p_chk127 in "${!pid_host_map[@]}"; do
                             _dbg "Ret 127 sweep: Check PID $p_chk127 (${pid_host_map[$p_chk127]})."
-                            if ! kill -0 "$p_chk127" 2>/dev/null; then 
+                            if ! kill -0 "$p_chk127" 2>/dev/null; then
                                 wait "$p_chk127" 2>/dev/null; local final_ret127=$?
                                 comp_pid="$p_chk127"; wait_ret=$final_ret127
                                 _dbg "Ret 127 sweep: PID $comp_pid done (ret $wait_ret)."
@@ -488,11 +489,11 @@ exec_parallel() {
                             fi
                         done
                     fi
-                    if [ -z "$comp_pid" ]; then 
+                    if [ -z "$comp_pid" ]; then
                         _dbg "Ret 127 sweep: No tracked PIDs found defunct. Assuming active jobs empty if map is empty."
                         if [ "${#pid_host_map[@]}" -eq 0 ]; then active_jobs=0; fi
                     fi
-                else 
+                else
                     echo -e "${CR}ERR/WARN: Child exited (wait ret $wait_ret), but PID NOT ID'd. Slot freed, output missed.${CN}" >&2
                     if [ "$active_jobs" -gt 0 ]; then
                         active_jobs=$((active_jobs - 1))
@@ -500,7 +501,7 @@ exec_parallel() {
                     fi
                 fi
 
-                if [ -z "$comp_pid" ]; then 
+                if [ -z "$comp_pid" ]; then
                     if [ "$done_jobs" -ge "$num_total" ] || ([ "$active_jobs" -eq 0 ] && [ "${#queue[@]}" -eq 0 ]); then
                         _dbg "Break main (PID un-ID'd, but term conditions met). Active: $active_jobs, Q: ${#queue[@]}, Done: $done_jobs/$num_total"
                         break
@@ -508,13 +509,13 @@ exec_parallel() {
                     _dbg "PID not ID'd, sleep 0.1s, continue. Active: $active_jobs, Done: $done_jobs"
                     sleep 0.1; continue
                 fi
-            fi 
+            fi
 
             local h_for_pid="${pid_host_map["$comp_pid"]}"
             local out_f="${pid_out_map["$comp_pid"]}"
             local err_f="${pid_err_map["$comp_pid"]}"
             local start_t_pid="${pid_start_map["$comp_pid"]}"
-            local slot_freed_num="${pid_slot_map["$comp_pid"]}" 
+            local slot_freed_num="${pid_slot_map["$comp_pid"]}"
 
             _dbg "Process PID: $comp_pid for host: '$h_for_pid' from slot $slot_freed_num. Exit: $wait_ret"
 
@@ -539,7 +540,7 @@ exec_parallel() {
                     echo -e "${CG}OK:${CN} ${CB}${h_for_pid}${CN} (PID $comp_pid) ${prog_ind}"
                     ok_cnt=$((ok_cnt + 1))
                 else
-                    if [ "$wait_ret" -eq 255 ]; then 
+                    if [ "$wait_ret" -eq 255 ]; then
                         echo -e "${CR}SSH_ERR:${CN} ${CB}${h_for_pid}${CN} (PID $comp_pid, Exit 255) ${prog_ind}" >&2
                     else
                         echo -e "${CR}FAIL:${CN} ${CB}${h_for_pid}${CN} (PID $comp_pid, Remote Exit $wait_ret) ${prog_ind}" >&2
@@ -554,11 +555,11 @@ exec_parallel() {
                     cat "$err_f" >&2
                 fi
                 echo -e "${CC}## End ${CB}${h_for_pid}${CN} ##${CN}"
-            fi 
+            fi
 
             _dbg "Unset PID $comp_pid maps. Free slot $slot_freed_num."
             if [[ -n "$slot_freed_num" ]]; then
-                slot_pids[$((slot_freed_num - 1))]="" 
+                slot_pids[$((slot_freed_num - 1))]=""
             else
                  _dbg "Warn: No slot num for PID $comp_pid to free."
             fi
@@ -567,11 +568,11 @@ exec_parallel() {
              _dbg "Decremented active_jobs to $active_jobs after processing PID $comp_pid."
 
 
-        elif [ "${#queue[@]}" -eq 0 ] && [ "$active_jobs" -eq 0 ]; then 
+        elif [ "${#queue[@]}" -eq 0 ] && [ "$active_jobs" -eq 0 ]; then
             _dbg "No active jobs, queue empty. Break main loop."
             break
-        fi 
-    done 
+        fi
+    done
 
     _dbg "Exited main loop. Done: $done_jobs. Active: $active_jobs. Queue: ${#queue[@]}. PIDs: ${!pid_host_map[*]}"
 
@@ -634,14 +635,20 @@ main() {
         if [ -z "$task_str" ]; then
             echo -e "${CR}Err: Piped/redirected input empty.${CN}" >&2; exit 1
         fi
+
+        # MODIFICATION: Capture remaining arguments and prepend them to the script
         if [ $# -gt 0 ]; then
-            echo -e "${CY}Warn: Args '$*' ignored with piped/redirected script.${CN}" >&2
+            local quoted_args
+            quoted_args=$(printf '%q ' "$@")
+            task_str="set -- ${quoted_args}\n${task_str}"
+            _dbg "Prepended args to script: set -- ${quoted_args}"
         fi
-    elif [ $# -eq 0 ]; then 
+
+    elif [ $# -eq 0 ]; then
         ex_mode="list_hosts"; specs_arg="@[*]"
-    elif [ $# -eq 1 ]; then 
+    elif [ $# -eq 1 ]; then
         ex_mode="list_hosts"; specs_arg="$1"
-    else 
+    else
         ex_mode="cmd"; specs_arg="$1"; shift; task_str="$*"
         if [ -z "$task_str" ]; then
             echo -e "${CR}Err: No command after host specs.${CN}" >&2
@@ -670,11 +677,11 @@ main() {
         # and specs_arg was a filter like @[...]
         if [[ "$specs_arg" == "@["*"]" || "$specs_arg" == *"@@["*"]" ]]; then
             if ! [ -f "$SSH_CFG" ]; then
-                 echo -e "${CR}(Note: SSH config '$SSH_CFG' was not found.)${CN}" >&2
+                echo -e "${CR}(Note: SSH config '$SSH_CFG' was not found.)${CN}" >&2
             elif ! grep -q -i "^Host " "$SSH_CFG" && [ -s "$SSH_CFG" ]; then
-                 echo -e "${CY}(Note: SSH config '$SSH_CFG' has no 'Host ' definitions.)${CN}" >&2
+                echo -e "${CY}(Note: SSH config '$SSH_CFG' has no 'Host ' definitions.)${CN}" >&2
             elif ! [ -s "$SSH_CFG" ] && [ -f "$SSH_CFG" ]; then
-                 echo -e "${CY}(Note: SSH config '$SSH_CFG' is empty.)${CN}" >&2
+                echo -e "${CY}(Note: SSH config '$SSH_CFG' is empty.)${CN}" >&2
             fi
         fi
         exit 1
@@ -687,7 +694,7 @@ main() {
     echo -e "${CC}Temp files for session: $SESS_TMP_DIR${CN}"
 
     local final_task="$task_str"
-    if [ "$ex_mode" = "cmd" ]; then 
+    if [ "$ex_mode" = "cmd" ]; then
         local cmd_parts=()
         IFS=' ' read -r -a cmd_parts <<< "$task_str"
         if [ ${#cmd_parts[@]} -gt 0 ]; then
@@ -717,7 +724,7 @@ main() {
                 else
                     final_task="$first_word --color=always"
                 fi
-                
+
                 if [[ "$final_task" != "$task_str" ]]; then
                     echo -e "${CC}Info: Mod cmd for $cmd_base to: '$final_task'${CN}"
                 fi
@@ -746,4 +753,3 @@ main() {
 
 # --- Call Main ---
 main "$@"
-
