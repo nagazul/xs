@@ -1,5 +1,5 @@
 #!/bin/bash
-# Version: 0.1.1
+# Version: v0.1.2
 
 # Neovim Latest Version Installer
 # Usage: curl -fsSL https://raw.githubusercontent.com/yourusername/yourrepo/main/install-nvim.sh | bash
