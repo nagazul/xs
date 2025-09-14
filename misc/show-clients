@@ -1,0 +1,190 @@
+#!/bin/bash
+
+# Configuration file location
+CONFIG_FILE="${HOME}/.xs/clients.conf"
+
+# Colors
+CR="\033[38;5;9m"    # Red
+CG="\033[38;5;10m"   # Green
+CY="\033[38;5;11m"   # Yellow
+CB="\033[38;5;12m"   # Blue
+CM="\033[38;5;13m"   # Magenta
+CC="\033[38;5;14m"   # Cyan
+CW="\033[38;5;15m"   # White
+CL="\033[38;5;252m"  # Light gray
+CD="\033[38;5;250m"  # Light gray (better visibility)
+CN="\033[0m"         # Reset
+RS="\033[0m"
+
+# Check if config file exists
+if [[ ! -f "$CONFIG_FILE" ]]; then
+    echo "Error: Configuration file not found at $CONFIG_FILE"
+    echo "Please create the configuration file first."
+    exit 1
+fi
+
+# Load configuration
+load_config() {
+    # Load subnet names
+    declare -gA subnet_names
+    while IFS='=' read -r subnet name; do
+        [[ $subnet =~ ^#.*$ || -z $subnet ]] && continue
+        subnet_names["$subnet"]="$name"
+    done < <(grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+=' "$CONFIG_FILE")
+    
+    # Load static entries
+    static_entries=""
+    while IFS='|' read -r ip hostname conn_type; do
+        [[ $ip =~ ^#.*$ || -z $ip ]] && continue
+        static_entries+="$ip	static-entry	$hostname	$conn_type"$'\n'
+    done < <(grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\|' "$CONFIG_FILE")
+    
+    # Load hostname transformations
+    declare -gA hostname_transforms
+    while IFS='|' read -r pattern replacement; do
+        [[ $pattern =~ ^#.*$ || -z $pattern ]] && continue
+        hostname_transforms["$pattern"]="$replacement"
+    done < <(grep -E '.*\|.*' "$CONFIG_FILE" | grep -v -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\|')
+}
+
+# Apply hostname transformations
+apply_transforms() {
+    local data="$1"
+    
+    # Apply each transformation pattern
+    for pattern in "${!hostname_transforms[@]}"; do
+        data=$(echo "$data" | sed -e "s/$pattern/${hostname_transforms[$pattern]}/g" 2>/dev/null)
+    done
+    
+    echo "$data"
+}
+
+# Process and display OpenVPN status
+process_openvpn_status() {
+    local filter="$1"
+    
+    # Convert subnet_names to string for awk
+    local subnet_names_str=""
+    for subnet in "${!subnet_names[@]}"; do
+        subnet_names_str+="${subnet}:${subnet_names[$subnet]} "
+    done
+    
+    # Collect all data
+    local all_data=""
+    
+    # Get OpenVPN data
+    local openvpn_data
+    openvpn_data=$(find /var/lib/docker/volumes/ -type f -name openvpn-status.log -exec grep "^CLIENT_LIST" {} \; 2>/dev/null | awk -F, '{print $4"\t"$3"\t"$2"\t"$8}')
+    
+    # Apply transformations to OpenVPN data
+    if [[ -n "$openvpn_data" ]]; then
+        openvpn_data=$(apply_transforms "$openvpn_data")
+        all_data="$openvpn_data"
+    fi
+    
+    # Add static entries
+    if [[ -n "$static_entries" ]]; then
+        if [[ -n "$all_data" ]]; then
+            all_data="$all_data"$'\n'"$static_entries"
+        else
+            all_data="$static_entries"
+        fi
+    fi
+    
+    # Filter if requested
+    if [[ -n "$filter" ]]; then
+        all_data=$(echo "$all_data" | grep -i "$filter")
+    fi
+    
+    # Check if we have any data
+    if [[ -z "$all_data" ]]; then
+        echo "No connections found."
+        return
+    fi
+    
+    # Sort and format output
+    echo "$all_data" | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n | \
+    awk -v CR="$CR" -v CG="$CG" -v CY="$CY" -v CB="$CB" -v CM="$CM" -v CC="$CC" \
+        -v CW="$CW" -v CL="$CL" -v CD="$CD" -v CN="$CN" -v subnet_names="$subnet_names_str" '
+        function print_separator(subnet, subnet_name) {
+            if (subnet_name != "") {
+                print CD "# " CM subnet_name CN
+            } else {
+                print CD "# " CM "Unknown (" subnet ")" CN
+            }
+        }
+
+        function format_date(date_string) {
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", date_string)
+            if (date_string == "static" || date_string == "N/A" || date_string == "") {
+                return "Static"
+            }
+            cmd = "date -d \"" date_string "\" \"+%Y-%m-%d %H:%M:%S\" 2>/dev/null"
+            if ((cmd | getline formatted_date) > 0) {
+                close(cmd)
+                return formatted_date
+            }
+            close(cmd)
+            return date_string
+        }
+
+        BEGIN {
+            last_subnet = ""
+            split(subnet_names, subnet_array)
+            for (i in subnet_array) {
+                split(subnet_array[i], parts, ":")
+                subnet_names_map[parts[1]] = parts[2]
+            }
+        }
+        {
+            ip = $1
+            ip_port = $2
+            name = $3
+            date_string = $4
+            
+            # Skip invalid or empty IP addresses
+            if (ip == "" || !match(ip, /^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$/)) {
+                next
+            }
+            
+            # Reconstruct full timestamp
+            for (i=5; i<=NF; i++) {
+                date_string = date_string " " $i
+            }
+            
+            datetime = format_date(date_string)
+
+            # Extract subnet
+            split(ip, ip_parts, ".")
+            subnet = ip_parts[1] "." ip_parts[2] "." ip_parts[3] ".0/24"
+            
+            # Print separator when subnet changes
+            if (subnet != last_subnet) {
+                print_separator(subnet, subnet_names_map[subnet])
+                last_subnet = subnet
+            }
+            
+            # Format output
+            if (ip_port == "static-entry") {
+                printf "%s%-15s\t%s%-15s\t%s%-30s\t%s%s%s\n", 
+                    CG, ip, CC, ip_port, CM, name, CD, datetime, CN
+            } else {
+                split(ip_port, parts, ":")
+                ip_addr = parts[1] ? parts[1] : "unknown"
+                port = parts[2] ? parts[2] : "unknown"
+                printf "%s%-15s\t%s%-15s%s:%s%s\t%s%-30s\t%s%s%s\n", 
+                    CG, ip, CC, ip_addr, CD, port, CN, CM, name, CD, datetime, CN
+            }
+        }
+    ' | column -t -s $'\t'
+}
+
+# Load configuration
+load_config
+
+# Main execution
+if [[ $# -eq 0 ]]; then
+    process_openvpn_status
+else
+    process_openvpn_status "$1"
+fi
