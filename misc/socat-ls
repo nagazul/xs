@@ -1,0 +1,350 @@
+#!/bin/bash
+
+# ==============================================================================
+# Socat Tree Viewer (lsocat)
+#
+# Displays all running socat processes with parent-child relationships,
+# service identification, and client names from config file.
+# ==============================================================================
+
+# --- Script Information ---
+VERSION="1.2.0 (2025-09-11)"
+SCRIPT_NAME=$(basename "$0")
+CONFIG_FILE="$HOME/socat.conf"
+OUTPUT_FILE="$(pwd)/lsocat.out"
+CACHE_TIMEOUT=600  # 10 minutes in seconds
+
+# --- Check if cached output is valid ---
+use_cached_output() {
+    if [ ! -f "$OUTPUT_FILE" ]; then
+        return 1  # No cache file
+    fi
+
+    local file_age=$(( $(date +%s) - $(stat -c %Y "$OUTPUT_FILE" 2>/dev/null || echo 0) ))
+
+    if [ $file_age -le $CACHE_TIMEOUT ]; then
+        return 0  # Cache is valid
+    else
+        return 1  # Cache is too old
+    fi
+}
+
+# --- Client Name Resolution Function ---
+get_client_name() {
+    local target_ip="$1"
+    local current_client=""
+
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo ""
+        return
+    fi
+
+    while IFS= read -r line; do
+        # Check if line is a comment with client name
+        if [[ "$line" =~ ^#[[:space:]]*([^[:space:]]+) ]]; then
+            current_client="${BASH_REMATCH[1]}"
+        # Check if line contains the target IP
+        elif [[ "$line" =~ ^[[:space:]]*([0-9.]+) ]] && [ "${BASH_REMATCH[1]}" = "$target_ip" ]; then
+            echo "$current_client"
+            return
+        fi
+    done < "$CONFIG_FILE"
+
+    echo ""
+}
+
+# --- Dynamic Service Name Detection Function ---
+get_service_name() {
+    local target_port="$1"
+
+    # First try to get service name from config file
+    if [ -f "$CONFIG_FILE" ]; then
+        while IFS= read -r line; do
+            # Skip comments and empty lines
+            [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+
+            # Parse config line: IP service:local_port:remote_port ...
+            if [[ "$line" =~ ^[[:space:]]*[0-9.]+ ]]; then
+                # Split line into words, skip IP (first word)
+                read -ra words <<< "$line"
+                for (( i=1; i<${#words[@]}; i++ )); do
+                    triplet="${words[$i]}"
+                    if [[ "$triplet" =~ ^([^:]+):([0-9]+):([0-9]+)$ ]]; then
+                        service_name="${BASH_REMATCH[1]}"
+                        remote_port="${BASH_REMATCH[3]}"
+
+                        if [ "$remote_port" = "$target_port" ]; then
+                            echo "$service_name"
+                            return
+                        fi
+                    fi
+                done
+            fi
+        done < "$CONFIG_FILE"
+    fi
+
+    # Fallback to hardcoded common services if not found in config
+    case "$target_port" in
+        22) echo "ssh" ;;
+        80) echo "http" ;;
+        443) echo "https" ;;
+        5022) echo "logstash" ;;
+        6022) echo "node" ;;
+        10051) echo "zabbix" ;;
+        25) echo "smtp" ;;
+        53) echo "dns" ;;
+        110) echo "pop3" ;;
+        143) echo "imap" ;;
+        993) echo "imaps" ;;
+        995) echo "pop3s" ;;
+        3306) echo "mysql" ;;
+        5432) echo "postgresql" ;;
+        6379) echo "redis" ;;
+        27017) echo "mongodb" ;;
+        *) echo "port${target_port}" ;;
+    esac
+}
+
+# --- Help Message Function ---
+usage() {
+    cat << EOF
+Socat Tree Viewer - v$VERSION
+
+Displays all running socat processes with parent-child relationships,
+service identification, and client names from config file.
+
+Usage: $SCRIPT_NAME [OPTION]
+
+OPTIONS:
+  -c, --compact    Show compact view (ports grouped by service)
+  -v, --verbose    Show verbose view with process statistics
+  -f, --force      Force fresh execution (ignore cached output)
+  -h, --help       Display this help message and exit
+  --version        Display the script version and exit
+
+OUTPUT:
+  - Displays results to terminal and saves to $OUTPUT_FILE
+  - Uses cached output if file is less than 10 minutes old
+  - Use --force to bypass cache
+
+FORMAT:
+  service_name:remote_port → remote_ip (client_name) port:local_port pid:parent_pid children:count [child_pids]
+
+EXAMPLES:
+  ssh:22 → 10.10.53.71 (lisn) port:2221 pid:3456890
+  logstash:5022 → 10.10.53.72 (lisn) port:5222 pid:3456992 children:2 [3457087,3457108]
+
+GREP EXAMPLES:
+  $SCRIPT_NAME | grep "(lisn)"           # All services for lisn client
+  grep "children:" $OUTPUT_FILE          # Only processes with active connections
+  grep "ssh:22" $OUTPUT_FILE             # All SSH services (from cached file)
+EOF
+}
+
+# --- Main Display Function ---
+display_socat_tree() {
+    local view_mode="$1"  # normal, compact, verbose
+
+    # Check if any socat processes are running
+    if ! pidof socat >/dev/null 2>&1; then
+        echo "No socat processes are currently running."
+        return
+    fi
+
+    # Get all socat PIDs at once
+    local all_pids=($(pidof socat))
+
+    # Collect all socat processes efficiently
+    declare -A all_processes
+    declare -A parent_children
+    declare -A process_commands
+    declare -A service_groups
+
+    # Single ps call to get all process info at once
+    local ps_output
+    ps_output=$(ps -o pid,ppid,cmd -p $(IFS=,; echo "${all_pids[*]}") 2>/dev/null | tail -n +2)
+
+    # Process ps output line by line
+    while IFS= read -r line; do
+        if [ -n "$line" ]; then
+            # Parse ps output: PID PPID CMD
+            read -r pid ppid cmd <<< "$line"
+
+            # Skip if not a socat TCP-LISTEN command
+            [[ "$cmd" == socat\ TCP-LISTEN:* ]] || continue
+
+            all_processes["$pid"]="$ppid"
+            process_commands["$pid"]="$cmd"
+
+            # Build parent-child relationships efficiently
+            if [ "$ppid" != "1" ] && [ -n "${process_commands[$ppid]}" ]; then
+                if [ "${process_commands[$ppid]}" = "$cmd" ]; then
+                    # This is a child process
+                    if [ -z "${parent_children[$ppid]}" ]; then
+                        parent_children["$ppid"]="$pid"
+                    else
+                        parent_children["$ppid"]+=" $pid"
+                    fi
+                fi
+            fi
+        fi
+    done <<< "$ps_output"
+
+    # Pre-compute service names to avoid repeated config file reads
+    declare -A service_cache
+
+    # Build service cache from config file once
+    if [ -f "$CONFIG_FILE" ]; then
+        while IFS= read -r line; do
+            [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+            if [[ "$line" =~ ^[[:space:]]*[0-9.]+ ]]; then
+                read -ra words <<< "$line"
+                for (( i=1; i<${#words[@]}; i++ )); do
+                    triplet="${words[$i]}"
+                    if [[ "$triplet" =~ ^([^:]+):([0-9]+):([0-9]+)$ ]]; then
+                        service_name="${BASH_REMATCH[1]}"
+                        remote_port="${BASH_REMATCH[3]}"
+                        service_cache["$remote_port"]="$service_name"
+                    fi
+                done
+            fi
+        done < "$CONFIG_FILE"
+    fi
+
+    # Fast service name lookup
+    get_cached_service_name() {
+        local port="$1"
+        if [ -n "${service_cache[$port]}" ]; then
+            echo "${service_cache[$port]}"
+        else
+            case "$port" in
+                22) echo "ssh" ;;
+                80) echo "http" ;;
+                443) echo "https" ;;
+                5022) echo "logstash" ;;
+                6022) echo "node" ;;
+                10051) echo "zabbix" ;;
+                *) echo "port${port}" ;;
+            esac
+        fi
+    }
+
+    # Pre-compute client names to avoid repeated config file reads
+    declare -A client_cache
+
+    if [ -f "$CONFIG_FILE" ]; then
+        local current_client=""
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^#[[:space:]]*([^[:space:]]+) ]]; then
+                current_client="${BASH_REMATCH[1]}"
+            elif [[ "$line" =~ ^[[:space:]]*([0-9.]+) ]]; then
+                client_cache["${BASH_REMATCH[1]}"]="$current_client"
+            fi
+        done < "$CONFIG_FILE"
+    fi
+
+    # Fast client name lookup
+    get_cached_client_name() {
+        local ip="$1"
+        echo "${client_cache[$ip]:-}"
+    }
+
+    # Process and display results
+    local parent_count=0
+    local total_children=0
+
+    # Sort PIDs numerically once
+    local sorted_pids=($(printf '%s\n' "${!all_processes[@]}" | sort -n))
+
+    for pid in "${sorted_pids[@]}"; do
+        ppid="${all_processes[$pid]}"
+        cmd="${process_commands[$pid]}"
+
+        # Skip if this is a child process
+        if [ "$ppid" != "1" ] && [ -n "${process_commands[$ppid]}" ]; then
+            if [ "${process_commands[$ppid]}" = "$cmd" ]; then
+                continue
+            fi
+        fi
+
+        # Extract info from command once
+        if [[ "$cmd" =~ socat\ TCP-LISTEN:([0-9]+),fork\ TCP:([0-9.]+):([0-9]+) ]]; then
+            local_port="${BASH_REMATCH[1]}"
+            remote_ip="${BASH_REMATCH[2]}"
+            remote_port="${BASH_REMATCH[3]}"
+
+            service_name=$(get_cached_service_name "$remote_port")
+            client_name=$(get_cached_client_name "$remote_ip")
+
+            children_pids="${parent_children[$pid]:-}"
+            child_count_this=$(echo $children_pids | wc -w)
+
+            # Format client display
+            if [ -n "$client_name" ]; then
+                client_display="($client_name)"
+            else
+                client_display=""
+            fi
+
+            # Output result
+            if [ "$child_count_this" -gt 0 ]; then
+                child_pids_formatted="[$(echo $children_pids | tr ' ' ',')]"
+                echo "${service_name}:${remote_port} → ${remote_ip} ${client_display} port:${local_port} pid:${pid} children:${child_count_this} ${child_pids_formatted}"
+            else
+                echo "${service_name}:${remote_port} → ${remote_ip} ${client_display} port:${local_port} pid:${pid}"
+            fi
+            ((parent_count++))
+            ((total_children += child_count_this))
+        fi
+    done
+
+    # Summary
+    local actual_children=0
+    for pid in "${!all_processes[@]}"; do
+        ppid="${all_processes[$pid]}"
+        if [ "$ppid" != "1" ] && [ -n "${process_commands[$ppid]}" ]; then
+            if [ "${process_commands[$ppid]}" = "${process_commands[$pid]}" ]; then
+                ((actual_children++))
+            fi
+        fi
+    done
+
+    echo
+    echo "=== Summary ==="
+    echo "Parent processes: $parent_count"
+    echo "Child processes: $actual_children"
+    echo "Total socat processes: $((parent_count + actual_children))"
+}
+
+# --- Argument Parsing ---
+VIEW_MODE="normal"
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -c|--compact)
+            VIEW_MODE="compact"
+            shift
+            ;;
+        -v|--verbose)
+            VIEW_MODE="verbose"
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --version)
+            echo "$SCRIPT_NAME version $VERSION"
+            exit 0
+            ;;
+        *)
+            echo "Error: Unknown option '$1'" >&2
+            echo
+            usage
+            exit 1
+            ;;
+    esac
+done
+
+# --- Run the display ---
+display_socat_tree "$VIEW_MODE"
