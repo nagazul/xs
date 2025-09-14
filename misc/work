@@ -1,11 +1,17 @@
 #!/bin/bash
 
-# Advanced System & Network Operations Simulator
-# This script simulates a wide range of complex administrative tasks, including
-# network management, disk operations, code deployment, and configuration management.
-# For SRE and Platform Engineering use only.
+# Enhanced System & Network Operations Simulator
+# Interactive training tool for SRE and Platform Engineering
+# Version: 2.0
+
+set -euo pipefail
 
 # --- Configuration ---
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly CONFIG_FILE="${SCRIPT_DIR}/sysops-sim.conf"
+readonly LOG_FILE="${SCRIPT_DIR}/sysops-sim.log"
+
+# Default configuration (can be overridden by config file)
 HOSTS=("srv-web-tm-01" "srv-db-roc3-01a" "k8s-worker-ntt-04" "ci-runner-data-02")
 REPOS=("platform/api-gateway" "infra/ansible-playbooks" "services/payment-processor")
 USERS=("d.ionescu" "a.popescu" "m.stoica")
@@ -13,253 +19,538 @@ IPS=("10.45.1.101" "192.168.10.5" "10.30.2.215" "172.16.31.58")
 DISKS=("/dev/sdc" "/dev/sdd" "/dev/mapper/vg01-lvol02")
 RAID_ARRAYS=("/dev/md0" "/dev/md1")
 
+# Simulation settings
+SPEED_MULTIPLIER=1.0
+INTERACTIVE_MODE=false
+CONTINUOUS_MODE=true
+SELECTED_OPERATIONS=()
 
 # --- ANSI Color Codes ---
-RED='\033[0;31m'
-YELLOW='\033[1;33m'
-GREEN='\033[0;32m'
-CYAN='\033[0;36m'
-BLUE='\033[0;34m'
-PURPLE='\033[0;35m'
-NC='\033[0m'
+readonly RED='\033[0;31m'
+readonly YELLOW='\033[1;33m'
+readonly GREEN='\033[0;32m'
+readonly CYAN='\033[0;36m'
+readonly BLUE='\033[0;34m'
+readonly PURPLE='\033[0;35m'
+readonly BOLD='\033[1m'
+readonly DIM='\033[2m'
+readonly NC='\033[0m'
 
-# --- Trap Ctrl+C for a clean exit ---
-trap ctrl_c INT
-function ctrl_c() {
-    echo -e "\n\n${YELLOW}Session terminated by user.${NC}"
+# --- Utility Functions ---
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"
+}
+
+error() {
+    echo -e "${RED}ERROR:${NC} $*" >&2
+    log "ERROR: $*"
+}
+
+info() {
+    echo -e "${CYAN}INFO:${NC} $*"
+    log "INFO: $*"
+}
+
+sleep_scaled() {
+    local duration="$1"
+    local scaled_duration
+    scaled_duration=$(echo "scale=2; $duration / $SPEED_MULTIPLIER" | bc -l 2>/dev/null || echo "$duration")
+    sleep "$scaled_duration"
+}
+
+random_element() {
+    local array=("$@")
+    echo "${array[$RANDOM % ${#array[@]}]}"
+}
+
+# --- Configuration Management ---
+load_config() {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        info "Loading configuration from $CONFIG_FILE"
+        # shellcheck source=/dev/null
+        source "$CONFIG_FILE"
+    fi
+}
+
+save_config() {
+    cat > "$CONFIG_FILE" << EOF
+# System Operations Simulator Configuration
+SPEED_MULTIPLIER=$SPEED_MULTIPLIER
+INTERACTIVE_MODE=$INTERACTIVE_MODE
+CONTINUOUS_MODE=$CONTINUOUS_MODE
+
+# Custom arrays (space-separated)
+HOSTS=($(printf '"%s" ' "${HOSTS[@]}"))
+USERS=($(printf '"%s" ' "${USERS[@]}"))
+IPS=($(printf '"%s" ' "${IPS[@]}"))
+EOF
+    info "Configuration saved to $CONFIG_FILE"
+}
+
+# --- Enhanced Operation Functions ---
+
+run_ansible_op() {
+    local playbooks=("deploy_nginx.yml" "patch_kernel.yml" "harden_ssh.yml" "update_packages.yml" "configure_monitoring.yml")
+    local selected_playbook selected_host task_count
+    
+    selected_playbook=$(random_element "${playbooks[@]}")
+    selected_host=$(random_element "${HOSTS[@]}")
+    task_count=$((RANDOM % 5 + 3))
+
+    echo -e "${PURPLE}[ANSIBLE]${NC} ${BOLD}Executing playbook:${NC} ${selected_playbook}"
+    echo -e "${DIM}Target: ${selected_host} | Tasks: ${task_count}${NC}"
+    sleep_scaled 0.5
+    
+    echo "$ ansible-playbook -i inventory/${selected_host} playbooks/${selected_playbook} --check --diff"
+    echo ""
+    
+    echo -e "${PURPLE}PLAY [${selected_playbook}] $(printf '%*s' 50 | tr ' ' '*')${NC}"
+    sleep_scaled 0.3
+    
+    # Simulate multiple tasks
+    local tasks=("Gathering Facts" "Update package cache" "Install packages" "Configure services" "Restart services" "Verify deployment")
+    for i in $(seq 1 "$task_count"); do
+        local task="${tasks[$((i-1)) % ${#tasks[@]}]}"
+        local status_color result
+        
+        if (( RANDOM % 10 < 8 )); then
+            status_color="$GREEN"
+            result="ok"
+        else
+            status_color="$YELLOW"
+            result="changed"
+        fi
+        
+        echo -e "${CYAN}TASK [$task] $(printf '%*s' 40 | tr ' ' '*')${NC}"
+        sleep_scaled 0.5
+        echo -e "${status_color}${result}: [${selected_host}]${NC}"
+        sleep_scaled 0.3
+    done
+    
+    local ok_count=$((RANDOM % 3 + 2))
+    local changed_count=$((RANDOM % 3 + 1))
+    
+    echo -e "${PURPLE}PLAY RECAP $(printf '%*s' 55 | tr ' ' '*')${NC}"
+    echo -e "${selected_host} : ${GREEN}ok=${ok_count}${NC} ${YELLOW}changed=${changed_count}${NC} unreachable=0 ${RED}failed=0${NC}"
+    
+    log "Ansible operation completed: $selected_playbook on $selected_host"
+}
+
+run_git_op() {
+    local repo user branch commit_hash operation
+    local branches=("main" "develop" "feature/api-enhancement" "hotfix/security-patch" "release/v2.1.0")
+    local operations=("pull" "merge" "rebase" "cherry-pick")
+    
+    repo=$(random_element "${REPOS[@]}")
+    user=$(random_element "${USERS[@]}")
+    branch=$(random_element "${branches[@]}")
+    operation=$(random_element "${operations[@]}")
+    
+    echo -e "${BLUE}[GIT]${NC} ${BOLD}Repository:${NC} ${repo}"
+    echo -e "${DIM}Operation: ${operation} | Branch: ${branch}${NC}"
+    
+    echo "$ cd /srv/git/${repo} && git ${operation} origin/${branch}"
+    sleep_scaled 0.5
+    
+    case "$operation" in
+        "pull")
+            echo "From github.com:company/${repo}"
+            echo " * branch            ${branch}     -> FETCH_HEAD"
+            echo "Updating a1b2c3d..e4f5g6h"
+            ;;
+        "merge")
+            echo "Merge made by the 'recursive' strategy."
+            ;;
+        "rebase")
+            echo "Successfully rebased and updated refs/heads/${branch}."
+            ;;
+        "cherry-pick")
+            commit_hash=$(openssl rand -hex 4)
+            echo "[${branch} ${commit_hash}] ${operation}: Apply hotfix"
+            ;;
+    esac
+    
+    sleep_scaled 1
+    
+    # Show commit details
+    commit_hash=$(openssl rand -hex 20)
+    echo -e "${YELLOW}Latest commit: ${commit_hash}${NC}"
+    echo -e "Author: ${user} <${user}@company.com>"
+    echo "Date:   $(date -d "-$((RANDOM % 72)) hours" '+%a %b %d %H:%M:%S %Y %z')"
+    echo ""
+    echo "    feat(${repo##*/}): Implement new caching strategy"
+    echo ""
+    echo -e " ${GREEN}src/handlers.go     | 15 +++++++++++++++${NC}"
+    echo -e " ${GREEN}config/cache.yaml   |  8 ++++++++${NC}"
+    echo -e " ${RED}legacy/old_cache.go | 23 -----------------------${NC}"
+    echo " 3 files changed, 23 insertions(+), 23 deletions(-)"
+    
+    log "Git operation completed: $operation in $repo"
+}
+
+run_disk_op() {
+    local disk size_gb operation
+    local operations=("format" "resize" "benchmark" "repair")
+    
+    disk=$(random_element "${DISKS[@]}")
+    operation=$(random_element "${operations[@]}")
+    size_gb=$((RANDOM % 500 + 100))
+    
+    echo -e "${RED}[STORAGE]${NC} ${BOLD}Disk operation:${NC} ${operation}"
+    echo -e "${DIM}Device: ${disk} | Size: ${size_gb}GB${NC}"
+    
+    case "$operation" in
+        "format")
+            echo "$ mkfs.ext4 -F ${disk}"
+            sleep_scaled 0.5
+            echo "Creating filesystem with $((size_gb * 262144)) 4k blocks"
+            for i in {1..10}; do
+                local progress=$((i * 10))
+                echo -ne "\rWriting superblocks and filesystem accounting information: ${progress}%"
+                sleep_scaled 0.2
+            done
+            echo -e "\n${GREEN}Filesystem created successfully${NC}"
+            ;;
+        "resize")
+            echo "$ resize2fs ${disk}"
+            echo "Resizing filesystem on ${disk} to $((size_gb * 1024 * 1024)) blocks"
+            sleep_scaled 1
+            echo -e "${GREEN}Filesystem resized successfully${NC}"
+            ;;
+        "benchmark")
+            echo "$ hdparm -tT ${disk}"
+            sleep_scaled 1
+            echo "Timing cached reads:   $(((RANDOM % 2000) + 1000)) MB in  2.00 seconds = $((RANDOM % 500 + 500)) MB/sec"
+            echo "Timing buffered disk reads: $(((RANDOM % 800) + 200)) MB in  3.01 seconds = $((RANDOM % 200 + 100)) MB/sec"
+            ;;
+        "repair")
+            echo "$ fsck -f ${disk}"
+            sleep_scaled 0.5
+            echo "Pass 1: Checking inodes, blocks, and sizes"
+            echo "Pass 2: Checking directory structure"
+            echo "Pass 3: Checking directory connectivity"
+            echo "Pass 4: Checking reference counts"
+            echo "Pass 5: Checking group summary information"
+            echo -e "${GREEN}${disk}: clean, $((RANDOM % 50000 + 10000)) files, $((RANDOM % 1000000 + 100000)) blocks${NC}"
+            ;;
+    esac
+    
+    log "Disk operation completed: $operation on $disk"
+}
+
+run_network_op() {
+    local target_ip operation port
+    local operations=("firewall" "tunnel" "monitor" "trace")
+    
+    target_ip=$(random_element "${IPS[@]}")
+    operation=$(random_element "${operations[@]}")
+    port=$((RANDOM % 5000 + 3000))
+    
+    echo -e "${CYAN}[NETWORK]${NC} ${BOLD}Operation:${NC} ${operation}"
+    echo -e "${DIM}Target: ${target_ip} | Port: ${port}${NC}"
+    
+    case "$operation" in
+        "firewall")
+            echo "$ iptables -A INPUT -s ${target_ip} -p tcp --dport ${port} -j ACCEPT"
+            sleep_scaled 0.5
+            echo -e "${GREEN}Firewall rule added${NC}"
+            echo "$ iptables -L INPUT -n --line-numbers | grep ${target_ip}"
+            echo "1    ACCEPT     tcp  --  ${target_ip}              0.0.0.0/0            tcp dpt:${port}"
+            ;;
+        "tunnel")
+            local remote_port=$((RANDOM % 5000 + 8000))
+            echo "$ ssh -L ${port}:localhost:${remote_port} admin@${target_ip}"
+            sleep_scaled 1
+            echo -e "${GREEN}SSH tunnel established${NC}"
+            echo "Local port ${port} forwarded to ${target_ip}:${remote_port}"
+            ;;
+        "monitor")
+            echo "$ netstat -tuln | grep :${port}"
+            sleep_scaled 0.5
+            echo "tcp        0      0 0.0.0.0:${port}            0.0.0.0:*               LISTEN"
+            echo "$ ss -tulpn | grep :${port}"
+            echo "tcp   LISTEN  0   128   *:${port}   *:*   users:((\"nginx\",pid=1234,fd=6))"
+            ;;
+        "trace")
+            echo "$ traceroute ${target_ip}"
+            sleep_scaled 0.5
+            for i in {1..8}; do
+                local hop_ip="10.$((RANDOM % 255)).$((RANDOM % 255)).$((RANDOM % 255))"
+                local latency="$((RANDOM % 50 + 1)).$((RANDOM % 999))"
+                echo " ${i}  ${hop_ip} (${hop_ip})  ${latency} ms"
+                sleep_scaled 0.3
+            done
+            echo " 9  ${target_ip} (${target_ip})  $((RANDOM % 20 + 5)).$((RANDOM % 999)) ms"
+            ;;
+    esac
+    
+    log "Network operation completed: $operation to $target_ip"
+}
+
+run_container_op() {
+    local operations=("deploy" "scale" "logs" "update")
+    local services=("nginx" "redis" "postgres" "api-gateway" "monitoring")
+    local operation service replicas
+    
+    operation=$(random_element "${operations[@]}")
+    service=$(random_element "${services[@]}")
+    replicas=$((RANDOM % 5 + 1))
+    
+    echo -e "${BLUE}[KUBERNETES]${NC} ${BOLD}Operation:${NC} ${operation}"
+    echo -e "${DIM}Service: ${service} | Replicas: ${replicas}${NC}"
+    
+    case "$operation" in
+        "deploy")
+            echo "$ kubectl apply -f manifests/${service}.yaml"
+            sleep_scaled 0.5
+            echo "deployment.apps/${service} created"
+            echo "service/${service} created"
+            echo -e "${GREEN}Deployment successful${NC}"
+            ;;
+        "scale")
+            echo "$ kubectl scale deployment ${service} --replicas=${replicas}"
+            sleep_scaled 0.5
+            echo "deployment.apps/${service} scaled"
+            echo "$ kubectl get pods -l app=${service}"
+            for i in $(seq 1 "$replicas"); do
+                local status=$(random_element "Running" "Pending" "Running" "Running")
+                echo "${service}-$(openssl rand -hex 4)-${i}   1/1     ${status}   0          2m"
+            done
+            ;;
+        "logs")
+            echo "$ kubectl logs -f deployment/${service} --tail=10"
+            sleep_scaled 0.5
+            local log_levels=("INFO" "WARN" "ERROR" "DEBUG")
+            for i in {1..5}; do
+                local level=$(random_element "${log_levels[@]}")
+                local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+                echo "[$timestamp] $level: Processing request #$((RANDOM % 1000))"
+                sleep_scaled 0.3
+            done
+            ;;
+        "update")
+            local version="v$((RANDOM % 3 + 1)).$((RANDOM % 10)).$((RANDOM % 10))"
+            echo "$ kubectl set image deployment/${service} ${service}=company/${service}:${version}"
+            sleep_scaled 1
+            echo "deployment.apps/${service} image updated"
+            echo "Waiting for rollout to finish..."
+            echo -e "${GREEN}deployment \"${service}\" successfully rolled out${NC}"
+            ;;
+    esac
+    
+    log "Container operation completed: $operation for $service"
+}
+
+run_monitoring_op() {
+    local operations=("alert" "metrics" "dashboard" "incident")
+    local services=("api-gateway" "database" "cache" "load-balancer")
+    local operation service
+    
+    operation=$(random_element "${operations[@]}")
+    service=$(random_element "${services[@]}")
+    
+    echo -e "${YELLOW}[MONITORING]${NC} ${BOLD}Event:${NC} ${operation}"
+    echo -e "${DIM}Service: ${service}${NC}"
+    
+    case "$operation" in
+        "alert")
+            local severity=$(random_element "WARNING" "CRITICAL" "INFO")
+            local cpu_usage=$((RANDOM % 40 + 60))
+            echo -e "${RED}ALERT: High CPU usage detected${NC}"
+            echo "Service: ${service}"
+            echo "Severity: ${severity}"
+            echo "CPU Usage: ${cpu_usage}%"
+            echo "Threshold: 80%"
+            echo "Duration: $((RANDOM % 10 + 1)) minutes"
+            ;;
+        "metrics")
+            echo "$ prometheus-query 'cpu_usage{service=\"${service}\"}''"
+            sleep_scaled 0.5
+            for i in {1..5}; do
+                local timestamp=$(($(date +%s) - i * 60))
+                local value=$((RANDOM % 100))
+                echo "${service}_cpu_usage{instance=\"prod-${i}\"} $value $timestamp"
+            done
+            ;;
+        "dashboard")
+            echo "Grafana Dashboard: ${service} Overview"
+            echo "┌─ CPU Usage ─────────────────┐"
+            echo "│ Current: $((RANDOM % 100))%               │"
+            echo "│ Average: $((RANDOM % 100))%               │"
+            echo "└─────────────────────────────┘"
+            echo "┌─ Memory Usage ──────────────┐"
+            echo "│ Used: $((RANDOM % 8))GB / 16GB           │"
+            echo "│ Available: $((16 - RANDOM % 8))GB             │"
+            echo "└─────────────────────────────┘"
+            ;;
+        "incident")
+            local incident_id="INC-$(date +%Y%m%d)-$(printf "%04d" $((RANDOM % 9999)))"
+            echo -e "${RED}INCIDENT CREATED: ${incident_id}${NC}"
+            echo "Title: ${service} service degradation"
+            echo "Status: Investigating"
+            echo "Priority: P2"
+            echo "Assigned: SRE Team"
+            echo "Created: $(date '+%Y-%m-%d %H:%M:%S')"
+            ;;
+    esac
+    
+    log "Monitoring operation completed: $operation for $service"
+}
+
+# --- Interactive Menu ---
+show_menu() {
+    echo -e "\n${BOLD}=== System Operations Simulator ===${NC}"
+    echo -e "${DIM}Select operation type:${NC}"
+    echo
+    echo "1) Ansible Automation"
+    echo "2) Git Operations" 
+    echo "3) Disk Management"
+    echo "4) Network Operations"
+    echo "5) Container/K8s"
+    echo "6) Monitoring/Alerts"
+    echo "7) Run All (Continuous)"
+    echo "8) Configuration"
+    echo "9) View Logs"
+    echo "0) Exit"
+    echo
+    echo -n "Choice [1-9, 0]: "
+}
+
+show_config_menu() {
+    echo -e "\n${BOLD}=== Configuration ===${NC}"
+    echo "1) Speed: ${SPEED_MULTIPLIER}x"
+    echo "2) Mode: $([ "$INTERACTIVE_MODE" = true ] && echo "Interactive" || echo "Automatic")"
+    echo "3) Save Configuration"
+    echo "4) Reset to Defaults"
+    echo "0) Back to Main Menu"
+    echo
+    echo -n "Choice [0-4]: "
+}
+
+# --- Signal Handlers ---
+cleanup() {
+    echo -e "\n\n${YELLOW}Simulation terminated. Logs saved to: ${LOG_FILE}${NC}"
     exit 0
 }
 
-# --- Operation Functions ---
+trap cleanup INT TERM
 
-function run_ansible_op() {
-    PLAYBOOK=("deploy_nginx.yml" "patch_kernel.yml" "harden_ssh.yml")
-    SELECTED_PLAYBOOK=${PLAYBOOK[$RANDOM % ${#PLAYBOOK[@]}]}
-    HOST=${HOSTS[$RANDOM % ${#HOSTS[@]}]}
-
-    echo -e "${PURPLE}[ANSIBLE]${NC} Running playbook ${SELECTED_PLAYBOOK} on host: ${HOST}"
-    sleep 1
-    echo "ansible-playbook -i hosts -l ${HOST} playbooks/${SELECTED_PLAYBOOK}"
-    echo ""
-    echo -e "${PURPLE}PLAY [${SELECTED_PLAYBOOK}] ******************************************************${NC}"
-    sleep 0.5
-    echo -e "${CYAN}TASK [Gathering Facts] *******************************************************${NC}"
-    echo -e "ok: [${HOST}]"
-    sleep 1
-    echo -e "${CYAN}TASK [common : Update apt cache] *******************************************${NC}"
-    echo -e "${YELLOW}changed: [${HOST}]${NC}"
-    sleep 1.5
-    echo -e "${CYAN}TASK [nginx : Install nginx] ***********************************************${NC}"
-    echo -e "${YELLOW}changed: [${HOST}]${NC}"
-    sleep 1
-    echo -e "${CYAN}TASK [firewall : Allow http traffic] *************************************${NC}"
-    echo -e "ok: [${HOST}]"
-    sleep 0.5
-    echo -e "${PURPLE}PLAY RECAP *******************************************************************${NC}"
-    echo -e "${HOST} : ${GREEN}ok=3${NC}    ${YELLOW}changed=2${NC}    unreachable=0    ${RED}failed=0${NC}    skipped=0    rescued=0    ignored=0"
-}
-
-function run_git_op() {
-    REPO=${REPOS[$RANDOM % ${#REPOS[@]}]}
-    USER=${USERS[$RANDOM % ${#USERS[@]}]}
-    BRANCH=("main" "feature/roc3-billing-api" "hotfix/data-leak")
-    SELECTED_BRANCH=${BRANCH[$RANDOM % ${#BRANCH[@]}]}
-
-    echo -e "${BLUE}[GIT]${NC} Performing git operations in /srv/git/${REPO}"
-    echo -e "git checkout ${SELECTED_BRANCH} && git pull origin ${SELECTED_BRANCH}"
-    sleep 1
-    echo "Switched to branch '${SELECTED_BRANCH}'"
-    echo "Your branch is up to date with 'origin/${SELECTED_BRANCH}'."
-    sleep 1
-    echo -e "${YELLOW}Fetching recent commits...${NC}"
-    sleep 1.5
-    COMMIT_HASH=$(cat /dev/urandom | tr -dc 'a-f0-9' | fold -w 40 | head -n 1)
-    echo -e "${YELLOW}commit ${COMMIT_HASH}${NC} (HEAD -> ${SELECTED_BRANCH}, origin/${SELECTED_BRANCH})"
-    echo -e "Author: ${USER} <${USER}@example.com>"
-    echo "Date:   $(date -d "-$(($RANDOM % 72)) hours" -R)"
-    echo ""
-    echo "    feat(api): Add caching layer for roc3 endpoint"
-    echo ""
-    echo "    Improves performance by adding a Redis cache."
-    echo ""
-    echo " ${GREEN}src/api/handlers.go | 24 ++++++++++++++++++++----${NC}"
-    echo " ${GREEN}src/config/main.go  |  2 ++${NC}"
-    echo " ${GREEN}Makefile            |  1 +${NC}"
-    echo " 3 files changed, 23 insertions(+), 4 deletions(-)"
-}
-
-function run_disk_op() {
-    DISK=${DISKS[$RANDOM % ${#DISKS[@]}]}
-    echo -e "${RED}[DISK-IO]${NC} Wiping partition table on ${DISK} for re-provisioning."
-    echo -e "Running: dd if=/dev/zero of=${DISK} bs=1M count=1024"
-    sleep 1
-    for i in {1..20}; do
-        BLOCKS=$(( $i * 51 ))
-        SPEED=$(echo "scale=1; 450 + $RANDOM % 100" | bc)
-        echo -n -e "\r${BLOCKS}+0 records in\n${BLOCKS}+0 records out\n${BLOCKS}554432 bytes (${BLOCKS} MB) copied, $(echo "scale=2; $i * 0.2" | bc) s, ${SPEED} MB/s"
-        sleep 0.2
+# --- Main Execution ---
+main() {
+    # Initialize
+    log "Simulation started"
+    load_config
+    
+    # Parse command line arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -i|--interactive)
+                INTERACTIVE_MODE=true
+                shift
+                ;;
+            -s|--speed)
+                SPEED_MULTIPLIER="$2"
+                shift 2
+                ;;
+            -o|--operation)
+                SELECTED_OPERATIONS+=("$2")
+                CONTINUOUS_MODE=false
+                shift 2
+                ;;
+            -h|--help)
+                echo "Usage: $0 [OPTIONS]"
+                echo "Options:"
+                echo "  -i, --interactive    Enable interactive mode"
+                echo "  -s, --speed FLOAT    Speed multiplier (default: 1.0)"
+                echo "  -o, --operation OP   Run specific operation(s)"
+                echo "  -h, --help          Show this help"
+                exit 0
+                ;;
+            *)
+                error "Unknown option: $1"
+                exit 1
+                ;;
+        esac
     done
-    echo -e "\n${GREEN}dd operation complete.${NC}"
+    
+    info "System Operations Simulator v2.0 started"
+    info "Mode: $([ "$INTERACTIVE_MODE" = true ] && echo "Interactive" || echo "Continuous")"
+    info "Speed: ${SPEED_MULTIPLIER}x"
+    echo -e "${DIM}Press Ctrl+C to stop or use --interactive for menu mode${NC}"
+    echo
+    
+    if [[ "$INTERACTIVE_MODE" = true ]]; then
+        # Interactive mode
+        while true; do
+            show_menu
+            read -r choice
+            
+            case $choice in
+                1) run_ansible_op ;;
+                2) run_git_op ;;
+                3) run_disk_op ;;
+                4) run_network_op ;;
+                5) run_container_op ;;
+                6) run_monitoring_op ;;
+                7) 
+                    echo -e "${GREEN}Starting continuous mode...${NC}"
+                    CONTINUOUS_MODE=true
+                    INTERACTIVE_MODE=false
+                    break
+                    ;;
+                8)
+                    while true; do
+                        show_config_menu
+                        read -r config_choice
+                        case $config_choice in
+                            1) 
+                                echo -n "Enter speed multiplier (0.1-10.0): "
+                                read -r new_speed
+                                if [[ $new_speed =~ ^[0-9]*\.?[0-9]+$ ]]; then
+                                    SPEED_MULTIPLIER="$new_speed"
+                                else
+                                    error "Invalid speed value"
+                                fi
+                                ;;
+                            2) 
+                                INTERACTIVE_MODE=$([ "$INTERACTIVE_MODE" = true ] && echo false || echo true)
+                                ;;
+                            3) save_config ;;
+                            4) 
+                                rm -f "$CONFIG_FILE"
+                                info "Configuration reset to defaults"
+                                ;;
+                            0) break ;;
+                            *) error "Invalid choice" ;;
+                        esac
+                    done
+                    ;;
+                0) cleanup ;;
+                *) error "Invalid choice" ;;
+            esac
+            
+            [[ "$choice" =~ ^[1-6]$ ]] && echo -e "\n${DIM}Press Enter to continue...${NC}" && read -r
+        done
+    fi
+    
+    # Continuous mode (default behavior)
+    if [[ "$CONTINUOUS_MODE" = true ]]; then
+        local operations=(run_ansible_op run_git_op run_disk_op run_network_op run_container_op run_monitoring_op)
+        
+        while true; do
+            local operation
+            if [[ ${#SELECTED_OPERATIONS[@]} -gt 0 ]]; then
+                operation=$(random_element "${SELECTED_OPERATIONS[@]}")
+            else
+                operation=$(random_element "${operations[@]}")
+            fi
+            
+            $operation
+            echo -e "\n${DIM}$(printf '%.78s' "$(printf '%*s' 78 | tr ' ' '-')")${NC}"
+            sleep_scaled $((RANDOM % 3 + 2))
+        done
+    fi
 }
 
-function run_network_op() {
-    TARGET_IP=${IPS[$RANDOM % ${#IPS[@]}]}
-    ACTION_TYPE=$((RANDOM % 3))
-
-    case $ACTION_TYPE in
-        0) # iptables
-            echo -e "${CYAN}[NET-FILTER]${NC} Inserting temporary firewall rule to debug traffic from ${TARGET_IP}"
-            echo "iptables -I INPUT 1 -s ${TARGET_IP}/32 -p tcp --dport 8080 -j LOG --log-prefix \"ROC3_DEBUG: \""
-            sleep 1
-            echo -e "${GREEN}Rule inserted.${NC}"
-            ;;
-        1) # socat
-            PORT1=$(($RANDOM % 5000 + 3000))
-            PORT2=$(($RANDOM % 5000 + 8000))
-            echo -e "${CYAN}[NET-RELAY]${NC} Establishing temporary socat relay for data migration."
-            echo "socat TCP-LISTEN:${PORT1},fork TCP:10.100.1.5:${PORT2}"
-            sleep 1
-            echo -e "${GREEN}Relay active. Listening on port ${PORT1}...${NC}"
-            ;;
-        2) # Bogus traffic
-            echo -e "${CYAN}[NET-TRAFFIC]${NC} Monitoring network traffic on eth0..."
-            echo "tcpdump -i eth0 -n -c 10 'host ${TARGET_IP}'"
-            sleep 0.5
-            for i in {1..10}; do
-                SRC_IP="${IPS[$RANDOM % ${#IPS[@]}]}"
-                DST_IP="${TARGET_IP}"
-                FLAGS=(". " "P. " "S " "F. ")
-                SELECTED_FLAG=${FLAGS[$RANDOM % ${#FLAGS[@]}]}
-                echo "$(date +"%T.%N" | cut -b1-12) IP ${SRC_IP}.$(($RANDOM%60000+1024)) > ${DST_IP}.443: Flags [${SELECTED_FLAG}], seq $(($RANDOM%1000)):$(($RANDOM%1000+1300)), ack $(($RANDOM%1000)), win 29200, length 1300"
-                sleep $(echo "scale=2; $RANDOM/16384" | bc)
-            done
-            ;;
-    esac
-}
-
-function run_code_analysis_op() {
-    echo -e "${GREEN}[CODE-ANALYSIS]${NC} Pasting code from buffer to analyze..."
-    sleep 1
-    # Use 'heredoc' to paste a block of text
-    cat <<- "EOF"
-// src/payment/processor.go
-package payment
-
-import (
-    "context"
-    "fmt"
-    "time"
-
-    "github.com/user/project/internal/database"
-    "github.com/user/project/internal/roc3"
-)
-
-// ProcessTransaction handles the payment logic
-func ProcessTransaction(ctx context.Context, amount int, currency string) (string, error) {
-    if amount <= 0 {
-        return "", fmt.Errorf("invalid amount")
-    }
-    // Call to legacy service
-    err := ntt.LegacyCharge(amount, currency)
-    if err != nil {
-        return "", err
-    }
-
-    // New ROC3 integration point
-    roc3Client := roc3.NewClient()
-    trackingID, err := roc3Client.Submit(ctx, amount)
-    if err != nil {
-        return "", err
-    }
-    return trackingID, nil
-}
-EOF
-    echo ""
-    sleep 2
-    echo -e "${YELLOW}Searching for function definitions related to transactions...${NC}"
-    echo "grep -r 'func.*Transaction' ."
-    sleep 1
-    echo -e "${GREEN}./src/payment/processor.go:${NC}func ProcessTransaction(ctx context.Context, amount int, currency string) (string, error) {"
-    echo -e "${GREEN}./src/ledger/entry.go:${NC}func CreateTransactionEntry(id string, details TransactionDetails) error {"
-    sleep 2
-    echo -e "${YELLOW}Extracting function names and file paths using awk...${NC}"
-    echo "grep -r 'func.*Transaction' . | awk -F'[:(]' '{print \$1, \$2}'"
-    sleep 1
-    echo "./src/payment/processor.go func ProcessTransaction"
-    echo "./src/ledger/entry.go func CreateTransactionEntry"
-}
-
-function run_raid_op() {
-    RAID_DEVICE=${RAID_ARRAYS[$RANDOM % ${#RAID_ARRAYS[@]}]}
-    echo -e "${RED}[STORAGE]${NC} Detected degraded RAID array: ${RAID_DEVICE}"
-    sleep 1
-    echo "mdadm --detail ${RAID_DEVICE}"
-    echo "${RAID_DEVICE}:"
-    echo "           Version : 1.2"
-    echo "     Creation Time : Mon Aug  4 10:30:15 2025"
-    echo "        Raid Level : raid1"
-    echo "        Array Size : 2097152 (2.00 TiB 2.20 TB)"
-    echo "     Used Dev Size : 2097152 (2.00 TiB 2.20 TB)"
-    echo "      Raid Devices : 2"
-    echo "     Total Devices : 2"
-    echo "       Persistence : Superblock is persistent"
-    echo ""
-    echo "             State : ${RED}clean, degraded${NC}"
-    echo "    Active Devices : 1"
-    echo "   Working Devices : 1"
-    echo "    Failed Devices : 1"
-    echo "     Spare Devices : 0"
-    echo ""
-    echo "Consistency Policy : resync"
-    echo ""
-    echo "    Number   Major   Minor   RaidDevice State"
-    echo "       0       8       16        0      active sync   /dev/sdb"
-    echo "       -       0        0        1      ${RED}faulty removed${NC}"
-    sleep 2
-    echo ""
-    echo -e "${YELLOW}Re-adding spare disk /dev/sde to array...${NC}"
-    echo "mdadm --manage ${RAID_DEVICE} --add /dev/sde"
-    sleep 1
-    echo "mdadm: added /dev/sde"
-    sleep 1
-    echo -e "${YELLOW}Monitoring rebuild status...${NC}"
-    for i in {1..25}; do
-        PERCENT=$(echo "scale=1; $i * 4.0" | bc)
-        SPEED=$(echo "scale=1; 150 + $RANDOM % 50" | bc)
-        FINISH=$(echo "scale=0; (100 - $PERCENT) * 2" | bc)
-        echo -n -e "\r${RAID_DEVICE}: [=>...................]  ${YELLOW}rebuild = ${PERCENT}%${NC} (${i}0000/2000000) finish=${FINISH}min speed=${SPEED}MB/sec"
-        sleep 0.3
-    done
-     for i in {1..25}; do
-        PERCENT=$(echo "scale=1; 50 + $i * 2.0" | bc)
-        SPEED=$(echo "scale=1; 150 + $RANDOM % 50" | bc)
-        FINISH=$(echo "scale=0; (100 - $PERCENT) * 2" | bc)
-        echo -n -e "\r${RAID_DEVICE}: [=========>..........]  ${YELLOW}rebuild = ${PERCENT}%${NC} (${i}0000/2000000) finish=${FINISH}min speed=${SPEED}MB/sec"
-        sleep 0.3
-    done
-    echo -e "\n${GREEN}Rebuild complete. Array is now clean.${NC}"
-    echo "State : ${GREEN}clean${NC}"
-    echo "    Number   Major   Minor   RaidDevice State"
-    echo "       0       8       16        0      active sync   /dev/sdb"
-    echo "       1       8       32        1      active sync   /dev/sde"
-
-}
-
-
-# --- Main Loop ---
-while true; do
-  OP_TYPE=$((RANDOM % 6))
-
-  case $OP_TYPE in
-    0) run_ansible_op ;;
-    1) run_git_op ;;
-    2) run_disk_op ;;
-    3) run_network_op ;;
-    4) run_code_analysis_op ;;
-    5) run_raid_op ;;
-  esac
-
-  echo "--------------------------------------------------------------------------------"
-  sleep $(echo "scale=2; 2 + $RANDOM/8192" | bc)
-done
-
+# Run main function with all arguments
+main "$@"
