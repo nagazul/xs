@@ -9,7 +9,6 @@ set -euo pipefail
 # --- Configuration ---
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly CONFIG_FILE="${SCRIPT_DIR}/sysops-sim.conf"
-readonly LOG_FILE="${SCRIPT_DIR}/sysops-sim.log"
 
 # Default configuration (can be overridden by config file)
 HOSTS=("srv-web-tm-01" "srv-db-roc3-01a" "k8s-worker-ntt-04" "ci-runner-data-02")
@@ -37,18 +36,12 @@ readonly DIM='\033[2m'
 readonly NC='\033[0m'
 
 # --- Utility Functions ---
-log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"
-}
-
 error() {
     echo -e "${RED}ERROR:${NC} $*" >&2
-    log "ERROR: $*"
 }
 
 info() {
     echo -e "${CYAN}INFO:${NC} $*"
-    log "INFO: $*"
 }
 
 sleep_scaled() {
@@ -132,8 +125,6 @@ run_ansible_op() {
     
     echo -e "${PURPLE}PLAY RECAP $(printf '%*s' 55 | tr ' ' '*')${NC}"
     echo -e "${selected_host} : ${GREEN}ok=${ok_count}${NC} ${YELLOW}changed=${changed_count}${NC} unreachable=0 ${RED}failed=0${NC}"
-    
-    log "Ansible operation completed: $selected_playbook on $selected_host"
 }
 
 run_git_op() {
@@ -184,8 +175,6 @@ run_git_op() {
     echo -e " ${GREEN}config/cache.yaml   |  8 ++++++++${NC}"
     echo -e " ${RED}legacy/old_cache.go | 23 -----------------------${NC}"
     echo " 3 files changed, 23 insertions(+), 23 deletions(-)"
-    
-    log "Git operation completed: $operation in $repo"
 }
 
 run_disk_op() {
@@ -234,8 +223,6 @@ run_disk_op() {
             echo -e "${GREEN}${disk}: clean, $((RANDOM % 50000 + 10000)) files, $((RANDOM % 1000000 + 100000)) blocks${NC}"
             ;;
     esac
-    
-    log "Disk operation completed: $operation on $disk"
 }
 
 run_network_op() {
@@ -283,8 +270,6 @@ run_network_op() {
             echo " 9  ${target_ip} (${target_ip})  $((RANDOM % 20 + 5)).$((RANDOM % 999)) ms"
             ;;
     esac
-    
-    log "Network operation completed: $operation to $target_ip"
 }
 
 run_container_op() {
@@ -337,8 +322,6 @@ run_container_op() {
             echo -e "${GREEN}deployment \"${service}\" successfully rolled out${NC}"
             ;;
     esac
-    
-    log "Container operation completed: $operation for $service"
 }
 
 run_monitoring_op() {
@@ -393,8 +376,6 @@ run_monitoring_op() {
             echo "Created: $(date '+%Y-%m-%d %H:%M:%S')"
             ;;
     esac
-    
-    log "Monitoring operation completed: $operation for $service"
 }
 
 # --- Interactive Menu ---
@@ -410,10 +391,9 @@ show_menu() {
     echo "6) Monitoring/Alerts"
     echo "7) Run All (Continuous)"
     echo "8) Configuration"
-    echo "9) View Logs"
     echo "0) Exit"
     echo
-    echo -n "Choice [1-9, 0]: "
+    echo -n "Choice [1-8, 0]: "
 }
 
 show_config_menu() {
@@ -429,7 +409,7 @@ show_config_menu() {
 
 # --- Signal Handlers ---
 cleanup() {
-    echo -e "\n\n${YELLOW}Simulation terminated. Logs saved to: ${LOG_FILE}${NC}"
+    echo -e "\n\n${YELLOW}Simulation terminated.${NC}"
     exit 0
 }
 
@@ -438,7 +418,6 @@ trap cleanup INT TERM
 # --- Main Execution ---
 main() {
     # Initialize
-    log "Simulation started"
     load_config
     
     # Parse command line arguments
