@@ -179,7 +179,15 @@ get_all_hosts_cfg() {
     _dbg "SSH config files: $(echo "$cfg_files" | tr '\n' ' ')"
 
     local hosts_output
-    hosts_output=$(echo "$cfg_files" | xargs grep -h -i "^Host " 2>/dev/null | awk '{for(i=2;i<=NF;i++) print $i}' | grep -Ev '[*?]' | sort -u) || true
+    # Parse Host lines, skipping any preceded by "# xrun:skip"
+    hosts_output=$(echo "$cfg_files" | xargs awk '
+        /^#.*xrun:skip/ { skip=1; next }
+        tolower($0) ~ /^host / {
+            if (skip) { skip=0; next }
+            for (i=2; i<=NF; i++) print $i
+        }
+        { skip=0 }
+    ' 2>/dev/null | grep -Ev '[*?]' | sort -u) || true
     echo "$hosts_output"
     if [ -z "$hosts_output" ]; then
       if [ -s "$SSH_CFG" ]; then
@@ -401,8 +409,8 @@ _run_task_remote() {
     remote_cmd=$(_get_effective_remote_cmd "$target_ssh")
 
     set +e # Allow capturing exit status
-    if [[ -n "$remote_cmd" ]]; then
-        # Host uses RemoteCommand (multi-hop SSH chain) — inject command into the chain
+    if [[ -n "$remote_cmd" && "$remote_cmd" == *ssh* ]]; then
+        # Host uses RemoteCommand with ssh hops — inject command into the chain
         _dbg "RemoteCommand detected for $target_ssh: $remote_cmd"
         local modified_rc
         local ssh_arr=("ssh" "${SSH_OPTS_BASE[@]}" "-T"
@@ -666,9 +674,18 @@ exec_parallel() {
                             echo "$out_content"
                         fi
                     elif [ "$wait_ret" -eq 255 ]; then
-                        echo -e "${CR}ERR${CN} ${CB}${pad_host}${CN} | ${CY}SSH connection failed${CN}" >&2
+                        echo -e "${CR}ERR${CN} ${CB}${pad_host}${CN} | ${CY}connection failed${CN}" >&2
                     else
-                        echo -e "${CR}ERR${CN} ${CB}${pad_host}${CN} | ${CY}exit $wait_ret${CN} ${err_content}" >&2
+                        # Show first meaningful line of stderr, truncated
+                        local err_short=""
+                        if [[ -n "$err_content" ]]; then
+                            err_short=$(echo "$err_content" | head -1 | sed 's/.*: //' | cut -c1-60)
+                        fi
+                        if [[ -n "$err_short" ]]; then
+                            echo -e "${CR}ERR${CN} ${CB}${pad_host}${CN} | ${CY}${err_short}${CN}" >&2
+                        else
+                            echo -e "${CR}ERR${CN} ${CB}${pad_host}${CN} | ${CY}exit $wait_ret${CN}" >&2
+                        fi
                     fi
                 fi
             fi
