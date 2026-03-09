@@ -19,6 +19,11 @@ curl -fsSL https://raw.githubusercontent.com/nagazul/xs/main/install/nvim.sh | b
 curl -fsSL https://raw.githubusercontent.com/nagazul/xs/main/install/nvim.sh | bash -s -- --clean
 ```
 
+**Install Codex:**
+```bash
+curl -fsSL https://raw.githubusercontent.com/nagazul/xs/main/install/codex.sh | bash
+```
+
 ## 📥 Local Usage
 
 ```bash
