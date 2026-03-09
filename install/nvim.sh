@@ -46,7 +46,7 @@ debug() { $VERBOSE && log "DEBUG: $*" || true; }
 ask_confirm() {
   local prompt="${1:-Proceed?}"
   if $ASSUME_YES; then return 0; fi
-  if ! is_tty; then warn "Non-interactive; use --yes to auto-confirm."; return 1; fi
+  if ! [[ -t 0 ]]; then warn "Non-interactive; use --yes to auto-confirm."; return 1; fi
   printf "%s [y/N]: " "$prompt" >&2
   read -r ans || true
   [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]]
