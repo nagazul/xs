@@ -6,7 +6,7 @@ set -euo pipefail
 
 # --- Configuration & Internal Variables ---
 # AI: Increment patch version for subsequent modifications.
-XRUN_VERSION="0.3.47" # Incremented patch version to reflect changes
+XRUN_VERSION="0.5.0" # RemoteCommand-aware SSH execution
 
 # --- Color Definitions ---
 CN='\033[0m'    # Reset/None
@@ -19,6 +19,7 @@ CC='\033[0;36m' # Cyan (info)
 
 SSH_CFG="$HOME/.ssh/config"
 SSH_TIMEOUT=10 # Seconds for SSH connection timeout
+XRUN_VERBOSE=0 # 0=compact output, 1=verbose (per-slot, PID details)
 
 XRUN_EXEC_STRAT="controlled_parallel" # Primary execution mode
 
@@ -56,6 +57,36 @@ _dbg() {
     fi
 }
 
+_get_effective_remote_cmd() {
+    # Get RemoteCommand for a host from ssh -G output
+    # Returns the command string, or empty if none/not set
+    local target="$1"
+    local rc
+    rc=$(ssh -G "$target" 2>/dev/null | awk 'tolower($1)=="remotecommand"{$1=""; sub(/^ /,""); print}')
+    if [[ -z "$rc" || "$rc" == "none" ]]; then
+        echo ""
+    else
+        echo "$rc"
+    fi
+}
+
+_modify_remote_cmd_for_exec() {
+    # Append a command to the final ssh hop in a RemoteCommand chain
+    # Handles patterns like:
+    #   "ssh -t user@host"                          → "ssh -t user@host <cmd>"
+    #   "echo ... && ssh -t host 'ssh -t user@h'"   → insert cmd before closing '
+    local rc="$1"
+    local cmd="$2"
+    # If RC ends with a single-quoted segment (nested ssh), insert cmd before closing quote
+    local re="^(.*)'([^']+)' *$"
+    if [[ "$rc" =~ $re ]]; then
+        echo "${BASH_REMATCH[1]}'${BASH_REMATCH[2]} ${cmd}'"
+    else
+        # Append command to end of RemoteCommand
+        echo "${rc} ${cmd}"
+    fi
+}
+
 print_usage() {
     local scr_name
     scr_name=$(basename "$0")
@@ -67,9 +98,10 @@ print_usage() {
     echo "   or: $scr_name <host_specs> # List matching hosts" >&2
     echo "   or: $scr_name             # List all hosts from $SSH_CFG" >&2
     echo "" >&2
-    echo "Options:" >&2
+    echo "Options (must come BEFORE host spec):" >&2
     echo "  -h, --help        - Show this help message and exit." >&2
-    echo "  -v, --version     - Show version information and exit." >&2
+    echo "  --version         - Show version information and exit." >&2
+    echo "  -v, --verbose     - Verbose output (per-slot progress, PIDs)." >&2
     echo "  -s, --sudo        - Prepend sudo to the remote command/script." >&2
     echo "" >&2
     echo "<host_specs> examples (comma-separated for OR, colon within @[] for AND):" >&2
@@ -120,27 +152,43 @@ is_bash43_plus() {
     fi
 }
 
+_resolve_ssh_configs() {
+    # Return all config files: main + any Include'd files (resolves ~ and globs)
+    local main_cfg="$1"
+    echo "$main_cfg"
+    if [ ! -f "$main_cfg" ]; then return 0; fi
+    grep -i "^Include " "$main_cfg" 2>/dev/null | awk '{print $2}' | while IFS= read -r pattern; do
+        # Expand ~ to $HOME
+        pattern="${pattern/#\~/$HOME}"
+        # Expand globs -- use compgen or ls
+        local f
+        for f in $pattern; do
+            [ -f "$f" ] && echo "$f"
+        done
+    done
+}
+
 get_all_hosts_cfg() {
     if [ ! -f "$SSH_CFG" ]; then
-        # Output error to stderr, but allow function to return (and return non-zero)
         echo -e "${CR}Error: SSH config file '$SSH_CFG' not found.${CN}" >&2
-        return 1 # Indicates failure to get hosts
+        return 1
     fi
-    # If grep finds nothing, it exits 1. If awk fails, it exits non-zero.
-    # We want to capture output if any, and not have set -e stop us here.
+    # Collect all config files (main + includes)
+    local cfg_files
+    cfg_files=$(_resolve_ssh_configs "$SSH_CFG")
+    _dbg "SSH config files: $(echo "$cfg_files" | tr '\n' ' ')"
+
     local hosts_output
-    hosts_output=$(grep -i "^Host " "$SSH_CFG" 2>/dev/null | awk '{print $2}' | grep -Ev '[*?]' | sort -u) || true
-    # If any command in the pipe fails (e.g. grep finds nothing), hosts_output might be empty.
-    # The `|| true` ensures this line doesn't cause script exit with `set -e`.
+    hosts_output=$(echo "$cfg_files" | xargs grep -h -i "^Host " 2>/dev/null | awk '{for(i=2;i<=NF;i++) print $i}' | grep -Ev '[*?]' | sort -u) || true
     echo "$hosts_output"
-    if ! grep -q -i "^Host " "$SSH_CFG" && [ -s "$SSH_CFG" ]; then
-      # File exists and is not empty, but no "Host " lines found
-      _dbg "SSH config '$SSH_CFG' exists but contains no 'Host ' definitions."
-    elif ! [ -s "$SSH_CFG" ] && [ -f "$SSH_CFG" ]; then
-      # File exists but is empty
-      _dbg "SSH config '$SSH_CFG' exists but is empty."
+    if [ -z "$hosts_output" ]; then
+      if [ -s "$SSH_CFG" ]; then
+        _dbg "SSH configs contain no 'Host ' definitions."
+      else
+        _dbg "SSH config '$SSH_CFG' is empty."
+      fi
     fi
-    return 0 # Successfully attempted to get hosts
+    return 0
 }
 
 ALL_HOSTS_CACHE=""
@@ -345,22 +393,47 @@ _run_task_remote() {
     local err_f="$5"
     local sudo_prefix="${6:-}" # Optional sudo prefix ("sudo " or "")
     local ret_code=0
-    local ssh_arr=("ssh" "${SSH_OPTS_BASE[@]}" "$XRUN_SSH_TTY_OPT" "$target_ssh")
 
     trap '' INT TERM EXIT # Child inherits trap, clear for child
 
+    # Check if this host uses RemoteCommand in SSH config
+    local remote_cmd
+    remote_cmd=$(_get_effective_remote_cmd "$target_ssh")
+
     set +e # Allow capturing exit status
-    if [ "$ex_mode" = "cmd" ]; then
-        "${ssh_arr[@]}" "${sudo_prefix}${task_str}" > "$out_f" 2> "$err_f"
-        ret_code=$?
-    elif [ "$ex_mode" = "pipe_script" ]; then
-        # The task_str now contains the script content, potentially with a `set --` line.
-        # The remote command simply needs to execute this content via bash.
-        printf '%s' "$task_str" | "${ssh_arr[@]}" "${sudo_prefix}bash -s" > "$out_f" 2> "$err_f"
-        ret_code=$?
+    if [[ -n "$remote_cmd" ]]; then
+        # Host uses RemoteCommand (multi-hop SSH chain) — inject command into the chain
+        _dbg "RemoteCommand detected for $target_ssh: $remote_cmd"
+        local modified_rc
+        local ssh_arr=("ssh" "${SSH_OPTS_BASE[@]}" "-T"
+            -o "RemoteCommand=none" -o "RequestTTY=no" "$target_ssh")
+
+        if [ "$ex_mode" = "cmd" ]; then
+            modified_rc=$(_modify_remote_cmd_for_exec "$remote_cmd" "${sudo_prefix}${task_str}")
+            _dbg "Modified RemoteCommand: $modified_rc"
+            "${ssh_arr[@]}" "$modified_rc" > "$out_f" 2> "$err_f"
+            ret_code=$?
+        elif [ "$ex_mode" = "pipe_script" ]; then
+            modified_rc=$(_modify_remote_cmd_for_exec "$remote_cmd" "${sudo_prefix}bash -s")
+            _dbg "Modified RemoteCommand (pipe): $modified_rc"
+            printf '%s' "$task_str" | "${ssh_arr[@]}" "$modified_rc" > "$out_f" 2> "$err_f"
+            ret_code=$?
+        else
+            echo "Internal Err: Unknown ex_mode '$ex_mode' in _run_task_remote for $target_ssh" > "$err_f"
+            ret_code=254
+        fi
     else
-        echo "Internal Err: Unknown ex_mode '$ex_mode' in _run_task_remote for $target_ssh" > "$err_f"
-        ret_code=254
+        local ssh_arr=("ssh" "${SSH_OPTS_BASE[@]}" "$XRUN_SSH_TTY_OPT" "$target_ssh")
+        if [ "$ex_mode" = "cmd" ]; then
+            "${ssh_arr[@]}" "${sudo_prefix}${task_str}" > "$out_f" 2> "$err_f"
+            ret_code=$?
+        elif [ "$ex_mode" = "pipe_script" ]; then
+            printf '%s' "$task_str" | "${ssh_arr[@]}" "${sudo_prefix}bash -s" > "$out_f" 2> "$err_f"
+            ret_code=$?
+        else
+            echo "Internal Err: Unknown ex_mode '$ex_mode' in _run_task_remote for $target_ssh" > "$err_f"
+            ret_code=254
+        fi
     fi
     return "$ret_code"
 }
@@ -373,7 +446,15 @@ exec_parallel() {
     local num_total=${#targets_ref[@]}
 
     _dbg "exec_parallel: Total hosts: $num_total, Max jobs: $MAX_JOBS, Sudo: '${sudo_prefix}'"
-    echo -e "${CC}Parallel run on $num_total host(s) (Max jobs: $MAX_JOBS)...${CN}"
+    if [[ "$XRUN_VERBOSE" -eq 1 ]]; then
+        echo -e "${CC}Parallel run on $num_total host(s) (Max jobs: $MAX_JOBS)...${CN}"
+    fi
+
+    # Track max host name length for compact output alignment
+    local max_host_len=0
+    for _t in "${targets_ref[@]}"; do
+        (( ${#_t} > max_host_len )) && max_host_len=${#_t}
+    done
 
     declare -A pid_host_map pid_out_map pid_err_map pid_start_map pid_slot_map
     declare -a slot_pids=() # Stores PID for each slot, or empty if free
@@ -415,7 +496,9 @@ exec_parallel() {
             local curr_err_f; curr_err_f=$(mktemp "${SESS_TMP_DIR}/${safe_name}.err.XXXXXX")
 
             _dbg "Launch: $target. Slot $slot_num_disp. Queue: ${#queue[@]}"
-            echo -e "${CM}Run: ${CB}$target${CN} (Slot ${slot_num_disp}/${MAX_JOBS}, Q: ${#queue[@]})...${CN}"
+            if [[ "$XRUN_VERBOSE" -eq 1 ]]; then
+                echo -e "${CM}Run: ${CB}$target${CN} (Slot ${slot_num_disp}/${MAX_JOBS}, Q: ${#queue[@]})...${CN}"
+            fi
 
             local launch_t; launch_t=$(date +%s)
             ( _run_task_remote "$target" "$ex_mode" "$task_str" "$curr_out_f" "$curr_err_f" "$sudo_prefix" ) &
@@ -534,27 +617,60 @@ exec_parallel() {
                 # done_jobs is incremented here.
                 done_jobs=$((done_jobs + 1)) # Increment done_jobs as we are processing its result
 
-                local prog_ind="${CM}[${done_jobs}/${num_total} Time: ${dur_s}s]${CN}"
-                echo # Blank line
                 if [ "$wait_ret" -eq 0 ]; then
-                    echo -e "${CG}OK:${CN} ${CB}${h_for_pid}${CN} (PID $comp_pid) ${prog_ind}"
                     ok_cnt=$((ok_cnt + 1))
                 else
-                    if [ "$wait_ret" -eq 255 ]; then
+                    fail_cnt=$((fail_cnt + 1))
+                fi
+
+                if [[ "$XRUN_VERBOSE" -eq 1 ]]; then
+                    # --- Verbose output (original style) ---
+                    local prog_ind="${CM}[${done_jobs}/${num_total} Time: ${dur_s}s]${CN}"
+                    echo # Blank line
+                    if [ "$wait_ret" -eq 0 ]; then
+                        echo -e "${CG}OK:${CN} ${CB}${h_for_pid}${CN} (PID $comp_pid) ${prog_ind}"
+                    elif [ "$wait_ret" -eq 255 ]; then
                         echo -e "${CR}SSH_ERR:${CN} ${CB}${h_for_pid}${CN} (PID $comp_pid, Exit 255) ${prog_ind}" >&2
                     else
                         echo -e "${CR}FAIL:${CN} ${CB}${h_for_pid}${CN} (PID $comp_pid, Remote Exit $wait_ret) ${prog_ind}" >&2
                     fi
-                    fail_cnt=$((fail_cnt + 1))
-                fi
+                    echo -e "${CC}## Out: ${CB}${h_for_pid}${CN} ##${CN}"
+                    if [ -f "$out_f" ] && [ -s "$out_f" ]; then cat "$out_f"; else echo "[No stdout]"; fi
+                    if [ -f "$err_f" ] && [ -s "$err_f" ]; then
+                        echo -e "${CY}## Err: ${CB}${h_for_pid}${CN} ##${CN}" >&2
+                        cat "$err_f" >&2
+                    fi
+                    echo -e "${CC}## End ${CB}${h_for_pid}${CN} ##${CN}"
+                else
+                    # --- Compact output: one line per host ---
+                    local pad_host
+                    printf -v pad_host "%-${max_host_len}s" "$h_for_pid"
+                    local out_content=""
+                    if [ -f "$out_f" ] && [ -s "$out_f" ]; then
+                        out_content=$(cat "$out_f")
+                    fi
+                    local err_content=""
+                    if [ -f "$err_f" ] && [ -s "$err_f" ]; then
+                        err_content=$(cat "$err_f")
+                    fi
+                    local line_count
+                    line_count=$(echo "$out_content" | wc -l)
 
-                echo -e "${CC}## Out: ${CB}${h_for_pid}${CN} ##${CN}"
-                if [ -f "$out_f" ] && [ -s "$out_f" ]; then cat "$out_f"; else echo "[No stdout]"; fi
-                if [ -f "$err_f" ] && [ -s "$err_f" ]; then
-                    echo -e "${CY}## Err: ${CB}${h_for_pid}${CN} ##${CN}" >&2
-                    cat "$err_f" >&2
+                    if [ "$wait_ret" -eq 0 ]; then
+                        if [[ "$line_count" -le 1 ]]; then
+                            # Single-line output: inline
+                            echo -e "${CG}OK${CN}  ${CB}${pad_host}${CN} | ${out_content}"
+                        else
+                            # Multi-line output: host as title, output below
+                            echo -e "${CG}OK${CN}  ${CB}${h_for_pid}${CN}"
+                            echo "$out_content"
+                        fi
+                    elif [ "$wait_ret" -eq 255 ]; then
+                        echo -e "${CR}ERR${CN} ${CB}${pad_host}${CN} | ${CY}SSH connection failed${CN}" >&2
+                    else
+                        echo -e "${CR}ERR${CN} ${CB}${pad_host}${CN} | ${CY}exit $wait_ret${CN} ${err_content}" >&2
+                    fi
                 fi
-                echo -e "${CC}## End ${CB}${h_for_pid}${CN} ##${CN}"
             fi
 
             _dbg "Unset PID $comp_pid maps. Free slot $slot_freed_num."
@@ -584,33 +700,49 @@ exec_parallel() {
         done
     fi
 
-    echo "--------------------------------------------------"
-    echo -e "${CC}Summary:${CN}"
-    echo -e "  ${CG}OK:   $ok_cnt${CN}"
-    echo -e "  ${CR}Fail: $fail_cnt${CN}"
-    echo -e "  Done: $done_jobs (Target: $num_total)"
-    echo "--------------------------------------------------"
+    if [[ "$XRUN_VERBOSE" -eq 1 ]]; then
+        echo "--------------------------------------------------"
+        echo -e "${CC}Summary:${CN}"
+        echo -e "  ${CG}OK:   $ok_cnt${CN}"
+        echo -e "  ${CR}Fail: $fail_cnt${CN}"
+        echo -e "  Done: $done_jobs (Target: $num_total)"
+        echo "--------------------------------------------------"
+    else
+        echo -e "---"
+        if [ "$fail_cnt" -eq 0 ]; then
+            echo -e "${CG}OK: $ok_cnt${CN}  ${CC}($num_total hosts)${CN}"
+        else
+            echo -e "${CG}OK: $ok_cnt${CN}  ${CR}Fail: $fail_cnt${CN}  ${CC}($num_total hosts)${CN}"
+        fi
+    fi
     if [ "$fail_cnt" -gt 0 ] || [ "$done_jobs" -lt "$num_total" ]; then return 1; else return 0; fi
 }
 
 # --- Main Script ---
 main() {
-    if [[ "${1:-}" == "-v" || "${1:-}" == "--version" ]]; then
-        echo "xrun version $XRUN_VERSION"
-        exit 0
-    fi
-
-    if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-        print_usage
-        exit 0
-    fi
-
     local sudo_prefix=""
-    if [[ "${1:-}" == "--sudo" || "${1:-}" == "-s" ]]; then
-        sudo_prefix="sudo "
-        shift # Consume the --sudo or -s flag
-        _dbg "Sudo mode enabled."
-    fi
+
+    # Parse xrun flags (before host spec) in a loop
+    while [[ $# -gt 0 ]]; do
+        case "${1}" in
+            --version)
+                echo "xrun version $XRUN_VERSION"; exit 0 ;;
+            -h|--help)
+                print_usage; exit 0 ;;
+            -v|--verbose)
+                XRUN_VERBOSE=1; shift ;;
+            -s|--sudo)
+                sudo_prefix="sudo "; shift ;;
+            -sv|-vs)
+                sudo_prefix="sudo "; XRUN_VERBOSE=1; shift ;;
+            -*)
+                # Unknown flag -- stop parsing, treat as part of host spec or command
+                break ;;
+            *)
+                break ;;
+        esac
+    done
+    _dbg "Flags parsed: verbose=$XRUN_VERBOSE sudo='${sudo_prefix}'"
 
     local specs_arg=""
     local ex_mode="" # "pipe_script", "list_hosts", "cmd"
@@ -670,7 +802,9 @@ main() {
         exit 0
     fi
 
-    echo -e "${CC}Resolve hosts for spec: $specs_arg...${CN}"
+    if [[ "$XRUN_VERBOSE" -eq 1 ]]; then
+        echo -e "${CC}Resolve hosts for spec: $specs_arg...${CN}"
+    fi
     if [ ${#targets_arr[@]} -eq 0 ]; then
         echo -e "${CR}Err: No hosts matched spec '$specs_arg' for exec.${CN}" >&2
         # Before exiting, check if SSH_CFG was the issue if ALL_HOSTS_CACHE is empty
@@ -690,8 +824,12 @@ main() {
     mkdir -p "$SESS_DIR_ROOT"
     SESS_TMP_DIR=$(mktemp -d "${SESS_DIR_ROOT}/xrun_sess.XXXXXX")
     # shellcheck disable=SC2064
-    trap 'echo -e "${CY}Cleanup $SESS_TMP_DIR...${CN}"; rm -rf "$SESS_TMP_DIR"' EXIT TERM INT
-    echo -e "${CC}Temp files for session: $SESS_TMP_DIR${CN}"
+    if [[ "$XRUN_VERBOSE" -eq 1 ]]; then
+        trap 'echo -e "${CY}Cleanup $SESS_TMP_DIR...${CN}"; rm -rf "$SESS_TMP_DIR"' EXIT TERM INT
+        echo -e "${CC}Temp files for session: $SESS_TMP_DIR${CN}"
+    else
+        trap 'rm -rf "$SESS_TMP_DIR"' EXIT TERM INT
+    fi
 
     local final_task="$task_str"
     if [ "$ex_mode" = "cmd" ]; then
@@ -725,16 +863,18 @@ main() {
                     final_task="$first_word --color=always"
                 fi
 
-                if [[ "$final_task" != "$task_str" ]]; then
+                if [[ "$final_task" != "$task_str" && "$XRUN_VERBOSE" -eq 1 ]]; then
                     echo -e "${CC}Info: Mod cmd for $cmd_base to: '$final_task'${CN}"
                 fi
             fi
         fi
     fi
 
-    echo -e "${CC}Found ${#targets_arr[@]} target(s). Strategy: $XRUN_EXEC_STRAT.${CN}"
-    if [[ -n "$sudo_prefix" ]]; then
-        echo -e "${CY}Executing with sudo.${CN}"
+    if [[ "$XRUN_VERBOSE" -eq 1 ]]; then
+        echo -e "${CC}Found ${#targets_arr[@]} target(s). Strategy: $XRUN_EXEC_STRAT.${CN}"
+        if [[ -n "$sudo_prefix" ]]; then
+            echo -e "${CY}Executing with sudo.${CN}"
+        fi
     fi
 
 
@@ -747,7 +887,9 @@ main() {
         exit 1
     fi
 
-    echo -e "${CG}xrun done.${CN}"
+    if [[ "$XRUN_VERBOSE" -eq 1 ]]; then
+        echo -e "${CG}xrun done.${CN}"
+    fi
     exit "$final_ret"
 }
 
