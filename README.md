@@ -1,16 +1,9 @@
 ## 🚀 ROC3 Dev Environment: Codex Edition
 
-Persistent Ubuntu dev environment on Ubuntu/Fedora with **CLIProxyAPI** pre-configured for an "Unlimited" Enterprise Codex bypass.
-
 ### 1. Host Preparation & Container Launch
 
-Run on your **host machine** to create directories and start the container.
-
 ```bash
-# Create persistent host directories
 mkdir -p ~/containers/roc3home ~/containers/roc3dev
-
-# Launch the container
 podman run -d --name roc3 --init --userns=keep-id \
   --security-opt label=disable \
   --device /dev/bus/usb -v /dev/bus/usb:/dev/bus/usb \
@@ -24,55 +17,48 @@ podman run -d --name roc3 --init --userns=keep-id \
 
 ### 2. Provision Dependencies (Root)
 
-Install system tools and set the environment path.
-
 ```bash
-# Install packages as root
 podman exec -u 0 roc3 bash -c "apt update && apt install -y curl git tig entr golang-go mc xdg-utils psmisc lsof just jq nano"
-
-# Add local binaries to PATH
 podman exec roc3 bash -c 'echo "export PATH=\$HOME/.local/bin:\$PATH" >> ~/.bashrc'
 
 ```
 
-### 3. Install Development Tools (User)
-
-Enter the container to install Neovim, the Codex Proxy, and Factory Droid.
+### 3. Install Tools (User)
 
 ```bash
 podman exec -it roc3 bash
-
-# Inside the container:
+# Run your custom installers
 curl -fsSL https://raw.githubusercontent.com/nagazul/xs/main/install/nvim.sh | bash
 curl -fsSL https://raw.githubusercontent.com/nagazul/xs/main/install/codex.sh | bash
 curl -fsSL https://app.factory.ai/cli | sh
 
 ```
 
-### 4. Configure CLIProxyAPI (The Codex Bypass)
+### 4. Setup CLIProxyAPI (The Codex Bypass)
 
-Map the `codex` nickname to your Enterprise session.
+If your `codex.sh` didn't fetch the binary, do it manually here:
 
 ```bash
-cat <<EOF > ~/dev/CLIProxyAPI/config.yaml
+# Clone and build (or download binary)
+cd ~/dev
+git clone https://github.com/zhangrr/CLIProxyAPI.git
+cd CLIProxyAPI
+go build -o cli-proxy-api main.go
+
+# Create the config
+cat <<EOF > config.yaml
 host: "0.0.0.0"
 port: 8081
 auth-dir: "/home/ubuntu/.cli-proxy-api"
-api-keys:
-  - "sk-factory-direct-link"
+api-keys: ["sk-factory-direct-link"]
 oauth-model-alias:
   codex:
-    - name: "gpt-5.4"
-      alias: "codex"
-      fork: true
-codex-api-key:
-  - api-key: "any-string"
+    - { name: "gpt-5.4", alias: "codex", fork: true }
+codex-api-key: [{ api-key: "any-string" }]
 debug: false
-usage-statistics-enabled: false
 EOF
 
-# Perform One-Time Login:
-cd ~/dev/CLIProxyAPI
+# One-time login
 ./cli-proxy-api --config config.yaml --codex-login
 
 ```
@@ -97,15 +83,13 @@ EOF
 
 ```
 
-### 6. Verification & Workflow
-
-Before launching Droid, verify the proxy sees your Codex session:
+### 6. Verification & Daily Workflow
 
 ```bash
-# 1. Start Proxy in background
+# 1. Start Proxy
 cd ~/dev/CLIProxyAPI && nohup ./cli-proxy-api --config config.yaml > proxy.log 2>&1 &
 
-# 2. Verify the Model Bridge (You should see "codex" and "gpt-5.4" in the list)
+# 2. VERIFY (Should show 'codex')
 curl -H "Authorization: Bearer sk-factory-direct-link" http://localhost:8081/v1/models | jq
 
 # 3. Start Droid
@@ -115,8 +99,7 @@ droid
 
 ---
 
-### 7. Key Paths for Host Access
+### 7. Important Persistence Note
 
-* **Settings:** `~/containers/roc3home/.factory/settings.json`
-* **Session Keys:** `~/containers/roc3home/.cli-proxy-api/`
-* **Projects:** `~/containers/roc3dev/`
+Your "Codex Key" is actually a file named `codex-*-enterprise.json` located in `~/containers/roc3home/.cli-proxy-api/`. As long as you keep that file, you stay logged in.
+
